@@ -191,71 +191,31 @@ impl ProxyServer {
         config: StdioConfig,
         handler: ProxyClientHandler,
     ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
-        // Try to connect with retry logic for servers that send logging notifications during initialization
-        let mut retries = 3;
-        let mut last_error = String::new();
-        
-        while retries > 0 {
-            let mut command = Command::new(&config.command);
-            command.args(&config.args);
-            command.envs(&config.env);
-            
-            // Configure stdio for MCP protocol communication
-            // stdin/stdout are used for JSON-RPC communication
-            // stderr should be piped to capture logs separately
-            command
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+        let mut command = Command::new(config.command);
+        command.args(config.args);
+        command.envs(config.env);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
-            #[cfg(unix)]
-            unsafe {
-                command.pre_exec(|| {
-                    // Create a new session to detach from controlling terminal
-                    if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-
-            let transport = match TokioChildProcess::new(command) {
-                Ok(t) => t,
-                Err(e) => {
-                    return Err(format!("Failed to start command for stdio server '{}': {}", server_name, e));
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                // Create a new session to detach from controlling terminal
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
-            };
-            
-            let result = serve_client(handler.clone(), transport).await;
-            
-            match result {
-                Ok(service) => return Ok(service),
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    last_error = error_msg.clone();
-                    
-                    // Check if this is a protocol mismatch due to logging notifications
-                    if error_msg.contains("expect initialized response, but received") && 
-                       error_msg.contains("LoggingMessageNotification") {
-                        tracing::warn!(
-                            server_name = %server_name, 
-                            retries_left = retries - 1,
-                            "Server sent logging notification during initialization, retrying..."
-                        );
-                        
-                        // Wait a bit before retrying
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        retries -= 1;
-                        continue;
-                    } else {
-                        // For other errors, don't retry
-                        return Err(format!("Failed to connect to stdio server '{}': {}", server_name, e));
-                    }
-                }
-            }
+                Ok(())
+            });
         }
-        
-        Err(format!("Failed to connect to stdio server '{}' after retries: {}", server_name, last_error))
+
+        let transport = TokioChildProcess::new(command).map_err(|e| {
+            format!("Failed to start command for stdio server '{}': {}", server_name, e)
+        })?;
+        serve_client(handler, transport)
+            .await
+            .map_err(|e| format!("Failed to connect to stdio server '{}': {}", server_name, e))
     }
 
     async fn connect_http_server(
@@ -265,7 +225,24 @@ impl ProxyServer {
         handler: ProxyClientHandler,
     ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
         let mut headers = header::HeaderMap::new();
-        if !config.authorization_token.is_empty() {
+        
+        // Add headers from the headers field
+        for (key, value) in &config.headers {
+            let header_name = header::HeaderName::from_bytes(key.as_bytes())
+                .map_err(|e| format!("Invalid header name '{}' for HTTP server '{}': {}", key, server_name, e))?;
+            let mut header_value = HeaderValue::from_str(value)
+                .map_err(|e| format!("Invalid header value for '{}' in HTTP server '{}': {}", key, server_name, e))?;
+            
+            // Mark authorization headers as sensitive
+            if header_name == header::AUTHORIZATION {
+                header_value.set_sensitive(true);
+            }
+            
+            headers.insert(header_name, header_value);
+        }
+        
+        // Backward compatibility: if authorization_token is provided and no Authorization header exists
+        if !config.authorization_token.is_empty() && !headers.contains_key(header::AUTHORIZATION) {
             let mut auth_value = HeaderValue::from_str(&config.authorization_token)
                 .map_err(|e| format!("Invalid authorization token for HTTP server '{}': {}", server_name, e))?;
             auth_value.set_sensitive(true);

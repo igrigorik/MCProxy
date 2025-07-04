@@ -29,6 +29,8 @@ pub struct HttpConfig {
     pub url: String,
     #[serde(default)]
     pub authorization_token: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 pub fn load_config(path: &str) -> anyhow::Result<McpConfig> {
@@ -55,7 +57,11 @@ mod tests {
             },
             "http-server": {
               "url": "http://localhost:8080",
-              "authorizationToken": "bearer-token"
+              "authorizationToken": "bearer-token",
+              "headers": {
+                "Authorization": "Bearer test-token",
+                "X-Custom-Header": "custom-value"
+              }
             }
           }
         }
@@ -79,6 +85,8 @@ mod tests {
         if let ServerConfig::Http(http_config) = http_server {
             assert_eq!(http_config.url, "http://localhost:8080");
             assert_eq!(http_config.authorization_token, "bearer-token");
+            assert_eq!(http_config.headers.get("Authorization"), Some(&"Bearer test-token".to_string()));
+            assert_eq!(http_config.headers.get("X-Custom-Header"), Some(&"custom-value".to_string()));
         } else {
             panic!("Expected Http server config");
         }
