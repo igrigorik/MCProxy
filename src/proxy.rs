@@ -3,650 +3,562 @@
 use crate::config::{HttpConfig, McpConfig, ServerConfig, StdioConfig};
 use futures::future;
 use rmcp::{
-    model::{
-        CallToolRequestParam, CallToolResult, ClientInfo, ListToolsResult, PaginatedRequestParam,
-        ServerInfo, Tool,
-    },
-    service::{serve_client, serve_server, NotificationContext, RoleClient, RunningService},
-    transport::{
-        streamable_http_client::{
-            StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
-        },
-        TokioChildProcess,
-    },
-    ClientHandler, Error as McpError, Peer, ServerHandler,
+    model::*,
+    service::{RequestContext, RoleServer, ServiceExt},
+    transport::streamable_http_client::StreamableHttpClientTransport,
+    Error as McpError, ServerHandler,
 };
-use reqwest::header::{self, HeaderValue};
 use std::{collections::HashMap, sync::Arc};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
-/// The main proxy server that aggregates tools from multiple MCP servers.
+/// The main proxy server that aggregates multiple MCP servers
 #[derive(Clone)]
 pub struct ProxyServer {
-    /// Active MCP client connections by server name
-    clients: HashMap<String, Peer<RoleClient>>,
-    /// All available tools with prefixed names (server:tool)
-    tools: HashMap<String, Tool>,
+    /// Connected MCP servers mapped by name
+    pub servers: Arc<RwLock<HashMap<String, ConnectedServer>>>,
+    /// Configuration for all servers
+    config: Arc<McpConfig>,
+    /// Process handles for stdio servers that need cleanup
+    process_handles: Arc<RwLock<HashMap<String, Child>>>,
+}
+
+/// Represents a connected MCP server
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields will be used when we implement server introspection API
+pub struct ConnectedServer {
+    /// Server name
+    pub name: String,
+    /// Available tools from this server
+    pub tools: Vec<Tool>,
+    /// Available prompts from this server
+    pub prompts: Vec<Prompt>,
+    /// Available resources from this server
+    pub resources: Vec<Resource>,
+    /// Client connection to this server
+    pub client: Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
 }
 
 impl ProxyServer {
-    pub fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-            tools: HashMap::new(),
-        }
+    /// Creates a new proxy server and connects to all configured MCP servers
+    pub async fn new(config: McpConfig) -> Result<Self, String> {
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+        let process_handles = Arc::new(RwLock::new(HashMap::new()));
+        let proxy = ProxyServer {
+            servers: servers.clone(),
+            config: Arc::new(config.clone()),
+            process_handles,
+        };
+
+        // Connect to all configured servers
+        proxy.connect_to_all_servers().await?;
+
+        Ok(proxy)
     }
 
-    /// Serve the proxy as an MCP server over the given transport
-    pub async fn serve<T>(&self, transport: T) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        T: rmcp::transport::Transport<rmcp::service::RoleServer> + Send + 'static,
-    {
-        let _service = serve_server(self.clone(), transport).await?;
-        // The service is now running in the background. We need to keep the function alive
-        // to prevent the service from being dropped. This is handled by the graceful shutdown
-        // logic in main.rs using tokio::select!
-        futures::future::pending::<()>().await;
-        Ok(())
-    }
+    /// Gracefully shutdown all connected servers
+    pub async fn shutdown(&self) {
+        info!("Shutting down proxy server and all connected MCP servers...");
 
-    /// Connect to all servers defined in config and perform initial tool discovery
-    pub async fn connect_and_discover(&mut self, config: McpConfig) -> Result<(), String> {
-        let total_servers = config.mcp_servers.len();
-        tracing::info!("Attempting to connect to {} servers...", total_servers);
-        
-        let connection_futures: Vec<_> = config
-            .mcp_servers
-            .into_iter()
-            .map(|(name, server_config)| {
-                let timeout_duration = std::time::Duration::from_secs(30);
-                let server_name = name.clone();
-                async move {
-                    let connect_future = ProxyServer::connect_to_server_static(name, server_config);
-                    match tokio::time::timeout(timeout_duration, connect_future).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            Err(format!("Connection to server '{}' timed out after 30 seconds", server_name))
+        // Clear server connections first. This will drop client services.
+        self.servers.write().await.clear();
+
+        let mut handles = self.process_handles.write().await;
+        let mut shutdown_futs = Vec::new();
+
+        for (name, mut child) in handles.drain() {
+            let fut = async move {
+                info!("Shutting down MCP server process: {}", name);
+
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    info!(
+                        "Sending SIGTERM to process group for {} (pgid: {})",
+                        name, pid
+                    );
+                    // Use libc to send SIGTERM to the entire process group for graceful shutdown
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGTERM);
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    // On Windows, start_kill is the best we can do for now
+                    let _ = child.start_kill();
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(status)) => info!("Process {} exited with status: {}", name, status),
+                    Ok(Err(e)) => warn!("Error waiting for process {}: {}", name, e),
+                    Err(_) => {
+                        warn!(
+                            "Process {} did not terminate gracefully, sending SIGKILL",
+                            name
+                        );
+                        if let Err(e) = child.kill().await {
+                            warn!("Failed to kill process {}: {}", name, e);
                         }
                     }
                 }
-            }).collect();
+            };
+            shutdown_futs.push(tokio::spawn(fut));
+        }
 
+        future::join_all(shutdown_futs).await;
+
+        info!("Proxy server shutdown complete");
+    }
+
+    /// Connect to all configured MCP servers
+    async fn connect_to_all_servers(&self) -> Result<(), String> {
+        let connection_futures: Vec<_> = self
+            .config
+            .mcp_servers
+            .iter()
+            .map(|(name, server_config)| {
+                let name = name.clone();
+                let server_config = server_config.clone();
+                let servers = self.servers.clone();
+                let process_handles = self.process_handles.clone();
+
+                async move {
+                    match Self::connect_to_server_static(
+                        name.clone(),
+                        server_config,
+                        process_handles,
+                    )
+                    .await
+                    {
+                        Ok((server_name, mut connected_server)) => {
+                            // Populate tools, prompts, and resources for the server
+                            Self::populate_server_capabilities(&mut connected_server).await;
+                            servers
+                                .write()
+                                .await
+                                .insert(server_name.clone(), connected_server);
+                            Ok(server_name)
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to connect to server {}: {}", name, e);
+                            Err((name, e))
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Wait for all connections to complete, but don't fail if some fail
         let results = future::join_all(connection_futures).await;
 
-        // Collect successful connections and track failures
         let mut successful_connections = Vec::new();
         let mut failed_connections = Vec::new();
-        
+
         for result in results {
             match result {
-                Ok((server_name, client)) => {
-                    tracing::info!(server_name = %server_name, "✓ Successfully connected to server");
-                    self.clients.insert(server_name.clone(), client.peer().clone());
-                    successful_connections.push((server_name, client));
-                }
-                Err(e) => {
-                    // Extract server name from error message if possible
-                    let server_name = if e.contains("stdio server '") {
-                        e.split("stdio server '").nth(1)
-                            .and_then(|s| s.split("'").next())
-                            .unwrap_or("unknown")
-                    } else if e.contains("HTTP server '") {
-                        e.split("HTTP server '").nth(1)
-                            .and_then(|s| s.split("'").next())
-                            .unwrap_or("unknown")
-                    } else {
-                        "unknown"
-                    };
-                    
-                    tracing::error!(server_name = %server_name, error = %e, "✗ Failed to connect to server");
-                    failed_connections.push((server_name.to_string(), e));
-                }
+                Ok(server_name) => successful_connections.push(server_name),
+                Err((server_name, error)) => failed_connections.push((server_name, error)),
             }
         }
 
-        // Print connection summary
-        if !failed_connections.is_empty() {
-            tracing::warn!("Connection Summary:");
-            tracing::warn!("  ✓ Connected: {}", successful_connections.len());
-            tracing::warn!("  ✗ Failed: {}", failed_connections.len());
-            
-            for (server_name, error) in &failed_connections {
-                let failure_reason = if error.contains("No such file or directory") {
-                    "Command not found"
-                } else if error.contains("connection closed: initialize response") {
-                    "Server failed to initialize"
-                } else if error.contains("HTTP status client error (401 Unauthorized)") {
-                    "Authentication failed"
-                } else if error.contains("expect initialized response, but received") {
-                    "Protocol mismatch - unexpected message"
-                } else {
-                    "Unknown error"
-                };
-                tracing::warn!("    {} - {}", server_name, failure_reason);
-            }
-        }
+        let connected_count = successful_connections.len();
+        let failed_count = failed_connections.len();
 
-        // Perform initial tool discovery
-        tracing::info!("Discovering tools from {} connected servers...", successful_connections.len());
-        let discovery_futures = successful_connections
-            .iter()
-            .map(|(server_name, client)| {
-                let peer = client.peer().clone();
-                let server_name = server_name.clone();
-                async move {
-                    tracing::debug!(server_name = %server_name, "Requesting tools from server...");
-                    let timeout_duration = std::time::Duration::from_secs(10);
-                    match tokio::time::timeout(timeout_duration, peer.list_all_tools()).await {
-                        Ok(Ok(tools)) => {
-                            let tool_names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
-                            tracing::info!(server_name = %server_name, "  ✓ Found {} tools: {:?}", tools.len(), tool_names);
-                            Some((server_name, tools))
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!(server_name = %server_name, error = %e, "  ✗ Failed to discover tools");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::error!(server_name = %server_name, "  ✗ Tool discovery timed out after 10 seconds");
-                            None
-                        }
-                    }
+        if connected_count > 0 {
+            tracing::info!("Successfully connected to {} servers", connected_count);
+            if failed_count > 0 {
+                tracing::warn!("Failed to connect to {} servers:", failed_count);
+                for (name, error) in failed_connections {
+                    tracing::warn!("  └─ ❌ {}: {}", name, error);
                 }
-            });
-
-        let discovery_results = future::join_all(discovery_futures).await;
-        
-        // Register discovered tools
-        for result in discovery_results.into_iter().flatten() {
-            let (server_name, tools) = result;
-            self.register_tools(&server_name, tools);
+            }
+            Ok(())
+        } else if self.config.mcp_servers.is_empty() {
+            // Allow starting with no servers configured (useful for testing)
+            tracing::info!("No MCP servers configured");
+            Ok(())
+        } else {
+            Err("Failed to connect to any MCP servers".to_string())
         }
-
-        // Final summary
-        tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        tracing::info!("MCP Proxy Initialization Complete:");
-        tracing::info!("  Servers configured: {}", total_servers);
-        tracing::info!("  Servers connected: {}", self.clients.len());
-        tracing::info!("  Total tools available: {}", self.tools.len());
-        
-        if !failed_connections.is_empty() {
-            tracing::warn!("  Failed connections: {} (see errors above)", failed_connections.len());
-        }
-        
-        tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        Ok(())
     }
 
-    /// Register tools from a server with proper prefixing
-    fn register_tools(&mut self, server_name: &str, tools: Vec<Tool>) {
-        // Remove old tools for this server
-        self.tools.retain(|k, _| !k.starts_with(&format!("{}:", server_name)));
+    /// Populate tools, prompts, and resources for a connected server
+    async fn populate_server_capabilities(server: &mut ConnectedServer) {
+        // Fetch tools
+        match server.client.list_tools(None).await {
+            Ok(tools_result) => {
+                server.tools = tools_result.tools;
+                tracing::debug!(
+                    "Populated {} tools for server {}",
+                    server.tools.len(),
+                    server.name
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch tools from server {}: {}",
+                    server.name,
+                    e
+                );
+            }
+        }
 
-        // Add new tools with prefixed names
-        for mut tool in tools {
-            let prefixed_name = format!("{}:{}", server_name, tool.name);
-            tool.name = prefixed_name.clone().into();
-            self.tools.insert(prefixed_name, tool);
+        // Fetch prompts
+        match server.client.list_prompts(None).await {
+            Ok(prompts_result) => {
+                server.prompts = prompts_result.prompts;
+                tracing::debug!(
+                    "Populated {} prompts for server {}",
+                    server.prompts.len(),
+                    server.name
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch prompts from server {}: {}",
+                    server.name,
+                    e
+                );
+            }
+        }
+
+        // Fetch resources
+        match server.client.list_resources(None).await {
+            Ok(resources_result) => {
+                server.resources = resources_result.resources;
+                tracing::debug!(
+                    "Populated {} resources for server {}",
+                    server.resources.len(),
+                    server.name
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to fetch resources from server {}: {}",
+                    server.name,
+                    e
+                );
+            }
         }
     }
 
     /// Connect to a single server based on its configuration
-    async fn connect_to_server(
-        &self,
-        name: String,
-        config: ServerConfig,
-    ) -> Result<(String, RunningService<RoleClient, ProxyClientHandler>), String> {
-        ProxyServer::connect_to_server_static(name, config).await
-    }
-
-    /// Static version of connect_to_server that doesn't require self
     async fn connect_to_server_static(
         name: String,
         config: ServerConfig,
-    ) -> Result<(String, RunningService<RoleClient, ProxyClientHandler>), String> {
-        let handler = ProxyClientHandler::new(name.clone());
-        
-        tracing::debug!(server_name = %name, "Connecting to server...");
-        
-        let client = match config {
-            ServerConfig::Stdio(stdio_config) => {
-                tracing::debug!(server_name = %name, command = %stdio_config.command, "Connecting via stdio");
-                ProxyServer::connect_stdio_server_static(&name, stdio_config, handler).await?
-            }
-            ServerConfig::Http(http_config) => {
-                tracing::debug!(server_name = %name, url = %http_config.url, "Connecting via HTTP");
-                ProxyServer::connect_http_server_static(&name, http_config, handler).await?
-            }
-        };
-
-        Ok((name, client))
-    }
-
-    async fn connect_stdio_server(
-        &self,
-        server_name: &str,
-        config: StdioConfig,
-        handler: ProxyClientHandler,
-    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
-        ProxyServer::connect_stdio_server_static(server_name, config, handler).await
+        process_handles: Arc<RwLock<HashMap<String, Child>>>,
+    ) -> Result<(String, ConnectedServer), String> {
+        if let Some(stdio_config) = config.as_stdio() {
+            tracing::info!("Connecting to stdio server: {}", name);
+            let handler = ();
+            Self::connect_stdio_server_static(&name, stdio_config, handler, process_handles)
+                .await
+                .map(|client| {
+                    let connected = ConnectedServer {
+                        name: name.clone(),
+                        tools: Vec::new(), // Will be populated after connection
+                        prompts: Vec::new(),
+                        resources: Vec::new(),
+                        client: Arc::new(client),
+                    };
+                    (name, connected)
+                })
+        } else if let Some(http_config) = config.as_http() {
+            tracing::info!("Connecting to HTTP server: {}", name);
+            let handler = ();
+            Self::connect_http_server_static(&name, http_config, handler)
+                .await
+                .map(|client| {
+                    let connected = ConnectedServer {
+                        name: name.clone(),
+                        tools: Vec::new(), // Will be populated after connection
+                        prompts: Vec::new(),
+                        resources: Vec::new(),
+                        client: Arc::new(client),
+                    };
+                    (name, connected)
+                })
+        } else {
+            Err(format!(
+                "Invalid server configuration for {}: unsupported server type",
+                name
+            ))
+        }
     }
 
     async fn connect_stdio_server_static(
         server_name: &str,
         config: StdioConfig,
-        handler: ProxyClientHandler,
-    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
-        let mut command = Command::new(config.command);
-        command.args(config.args);
-        command.envs(config.env);
-        // For MCP stdio transport, we need stdin/stdout as pipes for JSON-RPC communication
-        // Only redirect stderr to null to avoid interfering with the protocol
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+        handler: (),
+        process_handles: Arc<RwLock<HashMap<String, Child>>>,
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, String> {
+        tracing::debug!("Creating stdio transport for server: {}", server_name);
+
+        let mut cmd = Command::new(&config.command);
+        cmd.args(&config.args);
+        cmd.envs(&config.env);
 
         #[cfg(unix)]
-        unsafe {
-            command.pre_exec(|| {
-                // Create a new session to detach from controlling terminal
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        cmd.process_group(0);
 
-        let transport = TokioChildProcess::new(command).map_err(|e| {
-            format!("Failed to start command for stdio server '{}': {}", server_name, e)
-        })?;
-        serve_client(handler, transport)
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn child process: {}", e))?;
+
+        let stdout = child.stdout.take().expect("child stdout is piped");
+        let stdin = child.stdin.take().expect("child stdin is piped");
+
+        process_handles
+            .write()
             .await
-            .map_err(|e| format!("Failed to connect to stdio server '{}': {}", server_name, e))
-    }
+            .insert(server_name.to_string(), child);
 
-    async fn connect_http_server(
-        &self,
-        server_name: &str,
-        config: HttpConfig,
-        handler: ProxyClientHandler,
-    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
-        ProxyServer::connect_http_server_static(server_name, config, handler).await
+        // Create transport from the tuple (stdout, stdin) which automatically implements IntoTransport
+        let transport = (stdout, stdin);
+
+        tracing::debug!("Serving client for server: {}", server_name);
+        let client = handler
+            .serve(transport)
+            .await
+            .map_err(|e| format!("Failed to serve client: {}", e))?;
+
+        tracing::info!("Successfully connected to stdio server: {}", server_name);
+        Ok(client)
     }
 
     async fn connect_http_server_static(
         server_name: &str,
         config: HttpConfig,
-        handler: ProxyClientHandler,
-    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
-        let mut headers = header::HeaderMap::new();
-        
-        // Add headers from the headers field
-        for (key, value) in &config.headers {
-            let header_name = header::HeaderName::from_bytes(key.as_bytes())
-                .map_err(|e| format!("Invalid header name '{}' for HTTP server '{}': {}", key, server_name, e))?;
-            let mut header_value = HeaderValue::from_str(value)
-                .map_err(|e| format!("Invalid header value for '{}' in HTTP server '{}': {}", key, server_name, e))?;
-            
-            // Mark authorization headers as sensitive
-            if header_name == header::AUTHORIZATION {
-                header_value.set_sensitive(true);
-            }
-            
-            headers.insert(header_name, header_value);
-        }
-        
-        // Backward compatibility: if authorization_token is provided and no Authorization header exists
-        if !config.authorization_token.is_empty() && !headers.contains_key(header::AUTHORIZATION) {
-            let mut auth_value = HeaderValue::from_str(&config.authorization_token)
-                .map_err(|e| format!("Invalid authorization token for HTTP server '{}': {}", server_name, e))?;
-            auth_value.set_sensitive(true);
-            headers.insert(header::AUTHORIZATION, auth_value);
-        }
+        handler: (),
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, String> {
+        tracing::debug!("Creating HTTP transport for server: {}", server_name);
 
-        let http_client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client for server '{}': {}", server_name, e))?;
+        let uri: Arc<str> = Arc::from(config.url.as_str());
+        let transport = StreamableHttpClientTransport::from_uri(uri);
 
-        let transport = StreamableHttpClientTransport::with_client(
-            http_client,
-            StreamableHttpClientTransportConfig {
-                uri: Arc::from(config.url.as_str()),
-                ..Default::default()
-            },
-        );
-
-        serve_client(handler, transport)
+        tracing::debug!("Serving client for server: {}", server_name);
+        let client = handler
+            .serve(transport)
             .await
-            .map_err(|e| format!("Failed to connect to HTTP server '{}': {}", server_name, e))
+            .map_err(|e| format!("Failed to serve HTTP client: {}", e))?;
+
+        tracing::info!("Successfully connected to HTTP server: {}", server_name);
+        Ok(client)
+    }
+
+    /// Get all tools from all connected servers
+    pub async fn get_all_tools(&self) -> Vec<Tool> {
+        let mut all_tools = Vec::new();
+        let servers = self.servers.read().await;
+
+        for (server_name, server) in servers.iter() {
+            match server.client.list_tools(None).await {
+                Ok(tools_result) => {
+                    for mut tool in tools_result.tools {
+                        // Prefix tool names with server name to avoid conflicts
+                        tool.name = format!("{}:{}", server_name, tool.name).into();
+                        all_tools.push(tool);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get tools from server {}: {}", server_name, e);
+                }
+            }
+        }
+
+        all_tools
+    }
+
+    /// Get all prompts from all connected servers
+    pub async fn get_all_prompts(&self) -> Vec<Prompt> {
+        let mut all_prompts = Vec::new();
+        let servers = self.servers.read().await;
+
+        for (server_name, server) in servers.iter() {
+            match server.client.list_prompts(None).await {
+                Ok(prompts_result) => {
+                    for mut prompt in prompts_result.prompts {
+                        // Prefix prompt names with server name for disambiguation
+                        prompt.name = format!("{}:{}", server_name, prompt.name);
+                        all_prompts.push(prompt);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list prompts from server '{}': {}", server_name, e);
+                }
+            }
+        }
+
+        all_prompts
+    }
+
+    /// Get all resources from all connected servers
+    pub async fn get_all_resources(&self) -> Vec<Resource> {
+        let mut all_resources = Vec::new();
+        let servers = self.servers.read().await;
+
+        for (server_name, server) in servers.iter() {
+            match server.client.list_resources(None).await {
+                Ok(resources_result) => {
+                    for mut resource in resources_result.resources {
+                        // Prefix resource URIs with server name for disambiguation
+                        resource.uri = format!("{}:{}", server_name, resource.uri);
+                        all_resources.push(resource);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to list resources from server '{}': {}",
+                        server_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        all_resources
+    }
+
+    /// Find and call a tool on the appropriate server
+    pub async fn call_tool_on_server(
+        &self,
+        tool_name: &str,
+        arguments: Option<JsonObject>,
+    ) -> Result<CallToolResult, McpError> {
+        // Parse the prefixed tool name (format: "server_name:tool_name")
+        let (server_name, actual_tool_name) = if let Some(pos) = tool_name.find(':') {
+            let server_name = &tool_name[..pos];
+            let tool_name = &tool_name[pos + 1..];
+            (server_name, tool_name)
+        } else {
+            return Err(McpError::invalid_params(
+                format!("Invalid tool name format: {}", tool_name),
+                None,
+            ));
+        };
+
+        let servers = self.servers.read().await;
+        let server = servers
+            .get(server_name)
+            .ok_or_else(|| McpError::invalid_params(format!("Server not found: {}", server_name), None))?;
+
+        // Call the tool on the specific server
+        let param = CallToolRequestParam {
+            name: actual_tool_name.to_string().into(),
+            arguments,
+        };
+
+        server
+            .client
+            .call_tool(param)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to call tool on server {}: {}", server_name, e), None))
     }
 }
 
 impl ServerHandler for ProxyServer {
-    fn list_tools(
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+            server_info: Implementation {
+                name: "mcproxy".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            instructions: Some("MCP Proxy Server - aggregates multiple MCP servers".to_string()),
+        }
+    }
+
+    async fn list_tools(
         &self,
-        _req: Option<PaginatedRequestParam>,
-        _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        let tools = self.tools.values().cloned().collect();
-        future::ready(Ok(ListToolsResult {
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let tools = self.get_all_tools().await;
+        Ok(ListToolsResult {
             tools,
             next_cursor: None,
-        }))
+        })
     }
 
     async fn call_tool(
         &self,
-        req: CallToolRequestParam,
-        _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        request: CallToolRequestParam,
+        _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let tool_name = req.name.to_string();
-        let parts: Vec<&str> = tool_name.splitn(2, ':').collect();
-        
-        if parts.len() != 2 {
-            return Err(McpError::invalid_params(
-                "Invalid tool name format. Expected 'server:tool'",
-                None,
-            ));
-        }
-
-        let server_name = parts[0].to_string();
-        let original_tool_name = parts[1].to_string();
-
-        match self.clients.get(&server_name) {
-            Some(client) => {
-                client
-                    .call_tool(CallToolRequestParam {
-                        name: original_tool_name.into(),
-                        arguments: req.arguments,
-                    })
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))
-            }
-            None => Err(McpError::resource_not_found(
-                format!("Server '{}' not found for tool '{}'", server_name, tool_name),
-                None,
-            )),
-        }
+        self.call_tool_on_server(&request.name, request.arguments)
+            .await
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut server_info = ServerInfo::default();
-        server_info.capabilities.tools = Some(Default::default());
-        server_info
-    }
-}
-
-/// Handles notifications from upstream MCP servers (tool list changes, etc.)
-#[derive(Clone)]
-pub struct ProxyClientHandler {
-    server_name: String,
-}
-
-impl ProxyClientHandler {
-    pub fn new(server_name: String) -> Self {
-        Self { server_name }
-    }
-}
-
-impl ClientHandler for ProxyClientHandler {
-    fn on_tool_list_changed(
+    async fn list_prompts(
         &self,
-        _context: NotificationContext<RoleClient>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        let server_name = self.server_name.clone();
+        request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let mut all_prompts = Vec::new();
+        let servers = self.servers.read().await;
 
-        async move {
-            tracing::info!(server_name = %server_name, "Tool list changed, but proxy doesn't support dynamic updates yet");
-            // TODO: Implement dynamic tool updates by notifying the proxy
-            // For now, we just log the event
-        }
-    }
-
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmcp::model::Tool;
-    use serde_json::Map;
-    use std::sync::Arc;
-
-    // Helper function to create test proxy with public access to internal state
-    impl ProxyServer {
-        #[cfg(test)]
-        pub fn test_tools_len(&self) -> usize {
-            self.tools.len()
+        for (server_name, server) in servers.iter() {
+            match server.client.list_prompts(request.clone()).await {
+                Ok(prompts_result) => {
+                    for mut prompt in prompts_result.prompts {
+                        // Prefix prompt names with server name for disambiguation
+                        prompt.name = format!("{}:{}", server_name, prompt.name);
+                        all_prompts.push(prompt);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list prompts from server '{}': {}", server_name, e);
+                    // Continue with other servers
+                }
+            }
         }
 
-        #[cfg(test)]
-        pub fn test_has_tool(&self, key: &str) -> bool {
-            self.tools.contains_key(key)
+        Ok(ListPromptsResult {
+            prompts: all_prompts,
+            next_cursor: None, // TODO: Implement proper pagination
+        })
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let mut all_resources = Vec::new();
+        let servers = self.servers.read().await;
+
+        for (server_name, server) in servers.iter() {
+            match server.client.list_resources(request.clone()).await {
+                Ok(resources_result) => {
+                    for mut resource in resources_result.resources {
+                        // Prefix resource URIs with server name for disambiguation
+                        resource.uri = format!("{}:{}", server_name, resource.uri);
+                        all_resources.push(resource);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to list resources from server '{}': {}",
+                        server_name,
+                        e
+                    );
+                    // Continue with other servers
+                }
+            }
         }
 
-        #[cfg(test)]
-        pub fn test_clients_len(&self) -> usize {
-            self.clients.len()
-        }
-    }
-
-    #[test]
-    fn test_proxy_server_new() {
-        let proxy = ProxyServer::new();
-        assert_eq!(proxy.test_clients_len(), 0);
-        assert_eq!(proxy.test_tools_len(), 0);
-    }
-
-    #[test]
-    fn test_register_tools() {
-        let mut proxy = ProxyServer::new();
-        
-        // Create mock tools - using minimal structure to avoid schema issues
-        let tools = vec![
-            Tool {
-                name: "tool1".into(),
-                description: Some("Test tool 1".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-            Tool {
-                name: "tool2".into(),
-                description: Some("Test tool 2".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-        ];
-
-        proxy.register_tools("test-server", tools);
-
-        assert_eq!(proxy.test_tools_len(), 2);
-        assert!(proxy.test_has_tool("test-server:tool1"));
-        assert!(proxy.test_has_tool("test-server:tool2"));
-    }
-
-    #[test]
-    fn test_register_tools_replaces_existing() {
-        let mut proxy = ProxyServer::new();
-        
-        // Register initial tools
-        let initial_tools = vec![
-            Tool {
-                name: "old-tool".into(),
-                description: Some("Old tool".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-        ];
-        proxy.register_tools("test-server", initial_tools);
-        assert_eq!(proxy.test_tools_len(), 1);
-        assert!(proxy.test_has_tool("test-server:old-tool"));
-
-        // Register new tools for same server
-        let new_tools = vec![
-            Tool {
-                name: "new-tool".into(),
-                description: Some("New tool".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-        ];
-        proxy.register_tools("test-server", new_tools);
-
-        // Old tools should be replaced
-        assert_eq!(proxy.test_tools_len(), 1);
-        assert!(!proxy.test_has_tool("test-server:old-tool"));
-        assert!(proxy.test_has_tool("test-server:new-tool"));
-    }
-
-    #[test]
-    fn test_register_tools_different_servers() {
-        let mut proxy = ProxyServer::new();
-        
-        // Register tools for first server
-        let tools1 = vec![
-            Tool {
-                name: "tool1".into(),
-                description: Some("Tool from server 1".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-        ];
-        proxy.register_tools("server1", tools1);
-
-        // Register tools for second server
-        let tools2 = vec![
-            Tool {
-                name: "tool1".into(), // Same name, different server
-                description: Some("Tool from server 2".into()),
-                input_schema: Arc::new(Map::new()),
-                annotations: None,
-            },
-        ];
-        proxy.register_tools("server2", tools2);
-
-        // Both tools should exist with different prefixes
-        assert_eq!(proxy.test_tools_len(), 2);
-        assert!(proxy.test_has_tool("server1:tool1"));
-        assert!(proxy.test_has_tool("server2:tool1"));
-    }
-
-    // Note: Async tests with ServerHandler are complex due to rmcp's RequestContext structure
-    // Testing the core business logic through unit tests instead
-
-    #[test]
-    fn test_get_info() {
-        let proxy = ProxyServer::new();
-        let info = proxy.get_info();
-        
-        // Should have tools capability
-        assert!(info.capabilities.tools.is_some());
-    }
-
-    #[test]
-    fn test_proxy_client_handler_new() {
-        let handler = ProxyClientHandler::new("test-server".to_string());
-        assert_eq!(handler.server_name, "test-server");
-    }
-
-    #[test]
-    fn test_proxy_client_handler_get_info() {
-        let handler = ProxyClientHandler::new("test-server".to_string());
-        let info = handler.get_info();
-        
-        // Should return default client info
-        assert_eq!(info, ClientInfo::default());
-    }
-
-    #[test]
-    fn test_tool_name_parsing() {
-        // Test valid tool name parsing
-        let tool_name = "server:tool";
-        let parts: Vec<&str> = tool_name.splitn(2, ':').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "server");
-        assert_eq!(parts[1], "tool");
-
-        // Test tool name with multiple colons
-        let tool_name = "server:namespace:tool";
-        let parts: Vec<&str> = tool_name.splitn(2, ':').collect();
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0], "server");
-        assert_eq!(parts[1], "namespace:tool");
-
-        // Test invalid tool name (no colon)
-        let tool_name = "invalid-tool";
-        let parts: Vec<&str> = tool_name.splitn(2, ':').collect();
-        assert_eq!(parts.len(), 1);
-    }
-
-    #[test]
-    fn test_error_message_parsing() {
-        // Test server name extraction from error messages
-        let stdio_error = "Failed to connect to stdio server 'my-server': Connection failed";
-        let server_name = if stdio_error.contains("stdio server '") {
-            stdio_error.split("stdio server '").nth(1)
-                .and_then(|s| s.split("'").next())
-                .unwrap_or("unknown")
-        } else {
-            "unknown"
-        };
-        assert_eq!(server_name, "my-server");
-
-        let http_error = "Failed to connect to HTTP server 'api-server': 401 Unauthorized";
-        let server_name = if http_error.contains("HTTP server '") {
-            http_error.split("HTTP server '").nth(1)
-                .and_then(|s| s.split("'").next())
-                .unwrap_or("unknown")
-        } else {
-            "unknown"
-        };
-        assert_eq!(server_name, "api-server");
-
-        let generic_error = "Some generic error message";
-        let server_name = if generic_error.contains("stdio server '") {
-            generic_error.split("stdio server '").nth(1)
-                .and_then(|s| s.split("'").next())
-                .unwrap_or("unknown")
-        } else if generic_error.contains("HTTP server '") {
-            generic_error.split("HTTP server '").nth(1)
-                .and_then(|s| s.split("'").next())
-                .unwrap_or("unknown")
-        } else {
-            "unknown"
-        };
-        assert_eq!(server_name, "unknown");
-    }
-
-    #[test]
-    fn test_failure_reason_classification() {
-        // Test different error classifications
-        let test_cases = vec![
-            ("No such file or directory", "Command not found"),
-            ("connection closed: initialize response", "Server failed to initialize"),
-            ("HTTP status client error (401 Unauthorized)", "Authentication failed"),
-            ("expect initialized response, but received", "Protocol mismatch - unexpected message"),
-            ("Some random error", "Unknown error"),
-        ];
-
-        for (error_msg, expected_reason) in test_cases {
-            let actual_reason = if error_msg.contains("No such file or directory") {
-                "Command not found"
-            } else if error_msg.contains("connection closed: initialize response") {
-                "Server failed to initialize"
-            } else if error_msg.contains("HTTP status client error (401 Unauthorized)") {
-                "Authentication failed"
-            } else if error_msg.contains("expect initialized response, but received") {
-                "Protocol mismatch - unexpected message"
-            } else {
-                "Unknown error"
-            };
-            
-            assert_eq!(actual_reason, expected_reason, "Failed for error: {}", error_msg);
-        }
+        Ok(ListResourcesResult {
+            resources: all_resources,
+            next_cursor: None, // TODO: Implement proper pagination
+        })
     }
 } 

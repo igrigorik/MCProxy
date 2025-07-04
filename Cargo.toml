@@ -12,8 +12,10 @@ rmcp = { version = "0.2.1", features = [
     "macros",
     "transport-child-process",
     "transport-streamable-http-client",
+    "transport-streamable-http-server",
     "transport-sse-client",
     "transport-io",
+    "transport-async-rw",
     "reqwest",
     "auth",
 ] }
@@ -29,6 +31,11 @@ url = "2.5.0"
 reqwest = { version = "0.12", features = ["json"] }
 libc = "0.2"
 atty = "0.2"
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3.8"
+http-body-util = "0.1"

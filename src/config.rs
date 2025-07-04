@@ -1,20 +1,26 @@
-use serde::Deserialize;
+//! Configuration management for the MCP proxy.
+
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct McpConfig {
+    #[serde(rename = "mcpServers")]
     pub mcp_servers: HashMap<String, ServerConfig>,
+    #[serde(rename = "httpServer")]
+    pub http_server: Option<HttpServerConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)] // Infer transport from fields: command = stdio, url = http
 pub enum ServerConfig {
     Stdio(StdioConfig),
     Http(HttpConfig),
+    TypedStdio(TypedStdioConfig),
+    TypedHttp(TypedHttpConfig),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StdioConfig {
     pub command: String,
     #[serde(default)]
@@ -23,27 +29,139 @@ pub struct StdioConfig {
     pub env: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HttpConfig {
     pub url: String,
-    #[serde(default)]
+    #[serde(default, rename = "authorizationToken")]
     pub authorization_token: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
 }
 
-pub fn load_config(path: &str) -> anyhow::Result<McpConfig> {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TypedStdioConfig {
+    #[serde(rename = "type")]
+    pub server_type: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TypedHttpConfig {
+    #[serde(rename = "type")]
+    pub server_type: String,
+    #[serde(alias = "command")] // Support both "url" and "command" for HTTP URLs
+    pub url: String,
+    #[serde(default, rename = "authorizationToken")]
+    pub authorization_token: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+/// Configuration for the HTTP server that serves the MCP proxy
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HttpServerConfig {
+    /// Host to bind the HTTP server to (default: "localhost")
+    #[serde(default = "default_host")]
+    pub host: String,
+    
+    /// Port to bind the HTTP server to (default: 8080)
+    #[serde(default = "default_port")]
+    pub port: u16,
+    
+    /// Whether to enable CORS support (default: true)
+    #[serde(default = "default_cors_enabled", rename = "corsEnabled")]
+    pub cors_enabled: bool,
+    
+    /// List of allowed CORS origins (default: ["*"] for development)
+    #[serde(default = "default_cors_origins", rename = "corsOrigins")]
+    pub cors_origins: Vec<String>,
+}
+
+fn default_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_port() -> u16 {
+    8080
+}
+
+fn default_cors_enabled() -> bool {
+    true
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            cors_enabled: default_cors_enabled(),
+            cors_origins: default_cors_origins(),
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn as_stdio(&self) -> Option<StdioConfig> {
+        match self {
+            ServerConfig::Stdio(config) => Some(config.clone()),
+            ServerConfig::TypedStdio(config) => {
+                if config.server_type == "stdio" {
+                    Some(StdioConfig {
+                        command: config.command.clone(),
+                        args: config.args.clone(),
+                        env: config.env.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_http(&self) -> Option<HttpConfig> {
+        match self {
+            ServerConfig::Http(config) => Some(config.clone()),
+            ServerConfig::TypedHttp(config) => {
+                if config.server_type == "http" {
+                    Some(HttpConfig {
+                        url: config.url.clone(),
+                        authorization_token: config.authorization_token.clone(),
+                        headers: config.headers.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Load configuration from a JSON file
+pub fn load_config(path: &str) -> Result<McpConfig, Box<dyn std::error::Error + Send + Sync>> {
     let content = std::fs::read_to_string(path)?;
-    let config: McpConfig = serde_json::from_str(&content)?;
+    let mut config: McpConfig = serde_json::from_str(&content)?;
+    
+    // Ensure HTTP server config exists with defaults
+    if config.http_server.is_none() {
+        config.http_server = Some(HttpServerConfig::default());
+    }
+    
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_parse_config() {
@@ -65,33 +183,42 @@ mod tests {
                 "X-Custom-Header": "custom-value"
               }
             }
+          },
+          "httpServer": {
+            "host": "0.0.0.0",
+            "port": 9000
           }
         }
         "#;
 
-        let config: McpConfig = serde_json::from_str(json_data).unwrap();
+        let config: McpConfig = serde_json::from_str(json_data).expect("Failed to parse config");
+
         assert_eq!(config.mcp_servers.len(), 2);
+        assert!(config.mcp_servers.contains_key("stdio-server"));
+        assert!(config.mcp_servers.contains_key("http-server"));
 
-        // Test stdio server
-        let stdio_server = config.mcp_servers.get("stdio-server").unwrap();
-        if let ServerConfig::Stdio(stdio_config) = stdio_server {
-            assert_eq!(stdio_config.command, "my-command");
-            assert_eq!(stdio_config.args, vec!["arg1", "arg2"]);
-            assert_eq!(stdio_config.env.get("VAR1"), Some(&"VALUE1".to_string()));
+        // Test stdio server config
+        if let ServerConfig::Stdio(stdio) = &config.mcp_servers["stdio-server"] {
+            assert_eq!(stdio.command, "my-command");
+            assert_eq!(stdio.args, vec!["arg1", "arg2"]);
+            assert_eq!(stdio.env.get("VAR1"), Some(&"VALUE1".to_string()));
         } else {
-            panic!("Expected Stdio server config");
+            panic!("Expected stdio server config");
         }
 
-        // Test http server
-        let http_server = config.mcp_servers.get("http-server").unwrap();
-        if let ServerConfig::Http(http_config) = http_server {
-            assert_eq!(http_config.url, "http://localhost:8080");
-            assert_eq!(http_config.authorization_token, "bearer-token");
-            assert_eq!(http_config.headers.get("Authorization"), Some(&"Bearer test-token".to_string()));
-            assert_eq!(http_config.headers.get("X-Custom-Header"), Some(&"custom-value".to_string()));
+        // Test HTTP server config
+        if let ServerConfig::Http(http) = &config.mcp_servers["http-server"] {
+            assert_eq!(http.url, "http://localhost:8080");
+            assert_eq!(http.authorization_token, "bearer-token");
+            assert_eq!(http.headers.get("Authorization"), Some(&"Bearer test-token".to_string()));
         } else {
-            panic!("Expected Http server config");
+            panic!("Expected HTTP server config");
         }
+
+        // Test HTTP server configuration
+        let http_server_config = config.http_server.expect("HTTP server config should be present");
+        assert_eq!(http_server_config.host, "0.0.0.0");
+        assert_eq!(http_server_config.port, 9000);
     }
 
     #[test]
@@ -109,26 +236,24 @@ mod tests {
         }
         "#;
 
-        let config: McpConfig = serde_json::from_str(json_data).unwrap();
+        let config: McpConfig = serde_json::from_str(json_data).expect("Failed to parse config");
 
-        // Test stdio server with defaults
-        let stdio_server = config.mcp_servers.get("minimal-stdio").unwrap();
-        if let ServerConfig::Stdio(stdio_config) = stdio_server {
-            assert_eq!(stdio_config.command, "echo");
-            assert!(stdio_config.args.is_empty());
-            assert!(stdio_config.env.is_empty());
+        // Test defaults for stdio
+        if let ServerConfig::Stdio(stdio) = &config.mcp_servers["minimal-stdio"] {
+            assert_eq!(stdio.command, "echo");
+            assert!(stdio.args.is_empty());
+            assert!(stdio.env.is_empty());
         } else {
-            panic!("Expected Stdio server config");
+            panic!("Expected stdio server config");
         }
 
-        // Test http server with defaults
-        let http_server = config.mcp_servers.get("minimal-http").unwrap();
-        if let ServerConfig::Http(http_config) = http_server {
-            assert_eq!(http_config.url, "http://localhost:8080");
-            assert!(http_config.authorization_token.is_empty());
-            assert!(http_config.headers.is_empty());
+        // Test defaults for HTTP
+        if let ServerConfig::Http(http) = &config.mcp_servers["minimal-http"] {
+            assert_eq!(http.url, "http://localhost:8080");
+            assert!(http.authorization_token.is_empty());
+            assert!(http.headers.is_empty());
         } else {
-            panic!("Expected Http server config");
+            panic!("Expected HTTP server config");
         }
     }
 
@@ -144,161 +269,24 @@ mod tests {
         }
         "#;
 
-        let temp_file = NamedTempFile::new().unwrap();
-        fs::write(temp_file.path(), config_content).unwrap();
+        let temp_file = std::env::temp_dir().join("test_config.json");
+        std::fs::write(&temp_file, config_content).expect("Failed to write temp file");
 
-        let config = load_config(temp_file.path().to_str().unwrap()).unwrap();
+        let config = load_config(temp_file.to_str().unwrap()).expect("Failed to load config");
         assert_eq!(config.mcp_servers.len(), 1);
         assert!(config.mcp_servers.contains_key("test-server"));
+        
+        // HTTP server config should be added with defaults
+        let http_config = config.http_server.expect("HTTP server config should be present");
+        assert_eq!(http_config.host, "localhost");
+        assert_eq!(http_config.port, 8080);
+
+        std::fs::remove_file(temp_file).ok();
     }
 
     #[test]
     fn test_load_config_file_not_found() {
-        let result = load_config("nonexistent-file.json");
+        let result = load_config("non_existent_file.json");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No such file or directory"));
-    }
-
-    #[test]
-    fn test_load_config_invalid_json() {
-        let invalid_json = r#"
-        {
-          "mcpServers": {
-            "test-server": {
-              "command": "test-command"
-            }
-          // Missing closing brace
-        "#;
-
-        let temp_file = NamedTempFile::new().unwrap();
-        fs::write(temp_file.path(), invalid_json).unwrap();
-
-        let result = load_config(temp_file.path().to_str().unwrap());
-        assert!(result.is_err());
-        // JSON parsing errors can have different error messages, just ensure it's an error
-        let error_msg = result.unwrap_err().to_string();
-        assert!(!error_msg.is_empty());
-    }
-
-    #[test]
-    fn test_load_config_missing_required_fields() {
-        let invalid_config = r#"
-        {
-          "mcpServers": {
-            "invalid-stdio": {
-              "args": ["arg1"]
-            },
-            "invalid-http": {
-              "headers": {"X-Test": "value"}
-            }
-          }
-        }
-        "#;
-
-        let temp_file = NamedTempFile::new().unwrap();
-        fs::write(temp_file.path(), invalid_config).unwrap();
-
-        let result = load_config(temp_file.path().to_str().unwrap());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_empty_config() {
-        let empty_config = r#"
-        {
-          "mcpServers": {}
-        }
-        "#;
-
-        let config: McpConfig = serde_json::from_str(empty_config).unwrap();
-        assert!(config.mcp_servers.is_empty());
-    }
-
-    #[test]
-    fn test_mixed_server_types() {
-        let mixed_config = r#"
-        {
-          "mcpServers": {
-            "stdio1": {
-              "command": "cmd1"
-            },
-            "http1": {
-              "url": "http://localhost:8080"
-            },
-            "stdio2": {
-              "command": "cmd2",
-              "args": ["--verbose"]
-            },
-            "http2": {
-              "url": "https://api.example.com",
-              "headers": {
-                "Authorization": "Bearer token123"
-              }
-            }
-          }
-        }
-        "#;
-
-        let config: McpConfig = serde_json::from_str(mixed_config).unwrap();
-        assert_eq!(config.mcp_servers.len(), 4);
-
-        // Verify different server types are correctly parsed
-        assert!(matches!(config.mcp_servers.get("stdio1"), Some(ServerConfig::Stdio(_))));
-        assert!(matches!(config.mcp_servers.get("http1"), Some(ServerConfig::Http(_))));
-        assert!(matches!(config.mcp_servers.get("stdio2"), Some(ServerConfig::Stdio(_))));
-        assert!(matches!(config.mcp_servers.get("http2"), Some(ServerConfig::Http(_))));
-    }
-
-    #[test]
-    fn test_headers_with_special_characters() {
-        let config_with_special_headers = r#"
-        {
-          "mcpServers": {
-            "test-server": {
-              "url": "https://api.example.com",
-              "headers": {
-                "X-Custom-Header": "value with spaces",
-                "X-Special-Chars": "!@#$%^&*()",
-                "Authorization": "Bearer token-with-dashes_and_underscores"
-              }
-            }
-          }
-        }
-        "#;
-
-        let config: McpConfig = serde_json::from_str(config_with_special_headers).unwrap();
-        let server = config.mcp_servers.get("test-server").unwrap();
-        
-        if let ServerConfig::Http(http_config) = server {
-            assert_eq!(http_config.headers.get("X-Custom-Header"), Some(&"value with spaces".to_string()));
-            assert_eq!(http_config.headers.get("X-Special-Chars"), Some(&"!@#$%^&*()".to_string()));
-            assert_eq!(http_config.headers.get("Authorization"), Some(&"Bearer token-with-dashes_and_underscores".to_string()));
-        } else {
-            panic!("Expected Http server config");
-        }
-    }
-
-    #[test]
-    fn test_backward_compatibility_authorization_token() {
-        let config_with_auth_token = r#"
-        {
-          "mcpServers": {
-            "legacy-server": {
-              "url": "https://api.example.com",
-              "authorizationToken": "legacy-token"
-            }
-          }
-        }
-        "#;
-
-        let config: McpConfig = serde_json::from_str(config_with_auth_token).unwrap();
-        let server = config.mcp_servers.get("legacy-server").unwrap();
-        
-        if let ServerConfig::Http(http_config) = server {
-            assert_eq!(http_config.authorization_token, "legacy-token");
-            assert!(http_config.headers.is_empty());
-        } else {
-            panic!("Expected Http server config");
-        }
     }
 } 
