@@ -7,7 +7,7 @@ use rmcp::{
         CallToolRequestParam, CallToolResult, ClientInfo, ListToolsResult, PaginatedRequestParam,
         ServerInfo, Tool,
     },
-    service::{serve_client, NotificationContext, RoleClient, RunningService},
+    service::{serve_client, serve_server, NotificationContext, RoleClient, RunningService},
     transport::{
         streamable_http_client::{
             StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -37,15 +37,40 @@ impl ProxyServer {
         }
     }
 
+    /// Serve the proxy as an MCP server over the given transport
+    pub async fn serve<T>(&self, transport: T) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        T: rmcp::transport::Transport<rmcp::service::RoleServer> + Send + 'static,
+    {
+        let _service = serve_server(self.clone(), transport).await?;
+        // The service is now running in the background. We need to keep the function alive
+        // to prevent the service from being dropped. This is handled by the graceful shutdown
+        // logic in main.rs using tokio::select!
+        futures::future::pending::<()>().await;
+        Ok(())
+    }
+
     /// Connect to all servers defined in config and perform initial tool discovery
     pub async fn connect_and_discover(&mut self, config: McpConfig) -> Result<(), String> {
         let total_servers = config.mcp_servers.len();
         tracing::info!("Attempting to connect to {} servers...", total_servers);
         
-        let connection_futures = config
+        let connection_futures: Vec<_> = config
             .mcp_servers
             .into_iter()
-            .map(|(name, server_config)| self.connect_to_server(name, server_config));
+            .map(|(name, server_config)| {
+                let timeout_duration = std::time::Duration::from_secs(30);
+                let server_name = name.clone();
+                async move {
+                    let connect_future = ProxyServer::connect_to_server_static(name, server_config);
+                    match tokio::time::timeout(timeout_duration, connect_future).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            Err(format!("Connection to server '{}' timed out after 30 seconds", server_name))
+                        }
+                    }
+                }
+            }).collect();
 
         let results = future::join_all(connection_futures).await;
 
@@ -111,14 +136,19 @@ impl ProxyServer {
                 let server_name = server_name.clone();
                 async move {
                     tracing::debug!(server_name = %server_name, "Requesting tools from server...");
-                    match peer.list_all_tools().await {
-                        Ok(tools) => {
+                    let timeout_duration = std::time::Duration::from_secs(10);
+                    match tokio::time::timeout(timeout_duration, peer.list_all_tools()).await {
+                        Ok(Ok(tools)) => {
                             let tool_names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
                             tracing::info!(server_name = %server_name, "  ✓ Found {} tools: {:?}", tools.len(), tool_names);
                             Some((server_name, tools))
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!(server_name = %server_name, error = %e, "  ✗ Failed to discover tools");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::error!(server_name = %server_name, "  ✗ Tool discovery timed out after 10 seconds");
                             None
                         }
                     }
@@ -167,6 +197,14 @@ impl ProxyServer {
         name: String,
         config: ServerConfig,
     ) -> Result<(String, RunningService<RoleClient, ProxyClientHandler>), String> {
+        ProxyServer::connect_to_server_static(name, config).await
+    }
+
+    /// Static version of connect_to_server that doesn't require self
+    async fn connect_to_server_static(
+        name: String,
+        config: ServerConfig,
+    ) -> Result<(String, RunningService<RoleClient, ProxyClientHandler>), String> {
         let handler = ProxyClientHandler::new(name.clone());
         
         tracing::debug!(server_name = %name, "Connecting to server...");
@@ -174,11 +212,11 @@ impl ProxyServer {
         let client = match config {
             ServerConfig::Stdio(stdio_config) => {
                 tracing::debug!(server_name = %name, command = %stdio_config.command, "Connecting via stdio");
-                self.connect_stdio_server(&name, stdio_config, handler).await?
+                ProxyServer::connect_stdio_server_static(&name, stdio_config, handler).await?
             }
             ServerConfig::Http(http_config) => {
                 tracing::debug!(server_name = %name, url = %http_config.url, "Connecting via HTTP");
-                self.connect_http_server(&name, http_config, handler).await?
+                ProxyServer::connect_http_server_static(&name, http_config, handler).await?
             }
         };
 
@@ -191,12 +229,22 @@ impl ProxyServer {
         config: StdioConfig,
         handler: ProxyClientHandler,
     ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
+        ProxyServer::connect_stdio_server_static(server_name, config, handler).await
+    }
+
+    async fn connect_stdio_server_static(
+        server_name: &str,
+        config: StdioConfig,
+        handler: ProxyClientHandler,
+    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
         let mut command = Command::new(config.command);
         command.args(config.args);
         command.envs(config.env);
+        // For MCP stdio transport, we need stdin/stdout as pipes for JSON-RPC communication
+        // Only redirect stderr to null to avoid interfering with the protocol
         command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
 
         #[cfg(unix)]
@@ -220,6 +268,14 @@ impl ProxyServer {
 
     async fn connect_http_server(
         &self,
+        server_name: &str,
+        config: HttpConfig,
+        handler: ProxyClientHandler,
+    ) -> Result<RunningService<RoleClient, ProxyClientHandler>, String> {
+        ProxyServer::connect_http_server_static(server_name, config, handler).await
+    }
+
+    async fn connect_http_server_static(
         server_name: &str,
         config: HttpConfig,
         handler: ProxyClientHandler,
