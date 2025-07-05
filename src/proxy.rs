@@ -360,7 +360,7 @@ impl ProxyServer {
                 Ok(tools_result) => {
                     for mut tool in tools_result.tools {
                         // Prefix tool names with server name to avoid conflicts
-                        tool.name = format!("{}:{}", server_name, tool.name).into();
+                        tool.name = format!("{}___{}", server_name, tool.name).into();
                         all_tools.push(tool);
                     }
                 }
@@ -383,7 +383,7 @@ impl ProxyServer {
                 Ok(prompts_result) => {
                     for mut prompt in prompts_result.prompts {
                         // Prefix prompt names with server name for disambiguation
-                        prompt.name = format!("{}:{}", server_name, prompt.name);
+                        prompt.name = format!("{}___{}", server_name, prompt.name);
                         all_prompts.push(prompt);
                     }
                 }
@@ -406,7 +406,7 @@ impl ProxyServer {
                 Ok(resources_result) => {
                     for mut resource in resources_result.resources {
                         // Prefix resource URIs with server name for disambiguation
-                        resource.uri = format!("{}:{}", server_name, resource.uri);
+                        resource.uri = format!("{}___{}", server_name, resource.uri);
                         all_resources.push(resource);
                     }
                 }
@@ -429,10 +429,10 @@ impl ProxyServer {
         tool_name: &str,
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, McpError> {
-        // Parse the prefixed tool name (format: "server_name:tool_name")
-        let (server_name, actual_tool_name) = if let Some(pos) = tool_name.find(':') {
+        // Parse the prefixed tool name (format: "server_name___tool_name")
+        let (server_name, actual_tool_name) = if let Some(pos) = tool_name.find("___") {
             let server_name = &tool_name[..pos];
-            let tool_name = &tool_name[pos + 1..];
+            let tool_name = &tool_name[pos + 3..];  // Skip the 3 underscores
             (server_name, tool_name)
         } else {
             return Err(McpError::invalid_params(
@@ -511,7 +511,7 @@ impl ServerHandler for ProxyServer {
                 Ok(prompts_result) => {
                     for mut prompt in prompts_result.prompts {
                         // Prefix prompt names with server name for disambiguation
-                        prompt.name = format!("{}:{}", server_name, prompt.name);
+                        prompt.name = format!("{}___{}", server_name, prompt.name);
                         all_prompts.push(prompt);
                     }
                 }
@@ -541,7 +541,7 @@ impl ServerHandler for ProxyServer {
                 Ok(resources_result) => {
                     for mut resource in resources_result.resources {
                         // Prefix resource URIs with server name for disambiguation
-                        resource.uri = format!("{}:{}", server_name, resource.uri);
+                        resource.uri = format!("{}___{}", server_name, resource.uri);
                         all_resources.push(resource);
                     }
                 }
