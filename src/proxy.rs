@@ -1,6 +1,25 @@
 //! The core proxy server that aggregates multiple MCP servers.
+//! 
+//! This module implements the main proxy logic that:
+//! - Connects to multiple MCP servers (both stdio and HTTP)
+//! - Manages server lifecycles and graceful shutdown
+//! - Aggregates tools, prompts, and resources from all connected servers
+//! - Routes tool calls to the appropriate backend server
+//! 
+//! # Server Name Prefixing
+//! 
+//! To avoid naming conflicts between servers, all tool, prompt, and resource names
+//! are prefixed with the server name using the format: `server_name___item_name`
+//! 
+//! # Connection Management
+//! 
+//! The proxy maintains persistent connections to all configured servers and handles:
+//! - Automatic reconnection on failure (TODO)
+//! - Graceful shutdown with configurable timeout
+//! - Process management for stdio-based servers
 
 use crate::config::{HttpConfig, McpConfig, ServerConfig, StdioConfig};
+use crate::error::{ProxyError, Result};
 use futures::future;
 use rmcp::{
     model::*,
@@ -41,8 +60,24 @@ pub struct ConnectedServer {
 }
 
 impl ProxyServer {
+    /// Prefix a name with the server name using the standard separator
+    fn prefix_with_server(server_name: &str, name: &str) -> String {
+        format!("{}___{}", server_name, name)
+    }
+    
+    /// Extract server name and actual name from a prefixed string
+    fn extract_server_and_name(prefixed: &str) -> std::result::Result<(&str, &str), ProxyError> {
+        prefixed.find("___")
+            .map(|pos| (&prefixed[..pos], &prefixed[pos + 3..]))
+            .ok_or_else(|| ProxyError::invalid_format(
+                format!("Invalid prefixed name format: {}", prefixed)
+            ))
+    }
+    
+
+
     /// Creates a new proxy server and connects to all configured MCP servers
-    pub async fn new(config: McpConfig) -> Result<Self, String> {
+    pub async fn new(config: McpConfig) -> Result<Self> {
         let servers = Arc::new(RwLock::new(HashMap::new()));
         let process_handles = Arc::new(RwLock::new(HashMap::new()));
         let proxy = ProxyServer {
@@ -60,6 +95,12 @@ impl ProxyServer {
     /// Gracefully shutdown all connected servers
     pub async fn shutdown(&self) {
         info!("Shutting down proxy server and all connected MCP servers...");
+        
+        // Get shutdown timeout from config
+        let shutdown_timeout = self.config.http_server
+            .as_ref()
+            .map(|config| config.shutdown_timeout)
+            .unwrap_or(5);
 
         // Clear server connections first. This will drop client services.
         self.servers.write().await.clear();
@@ -68,6 +109,7 @@ impl ProxyServer {
         let mut shutdown_futs = Vec::new();
 
         for (name, mut child) in handles.drain() {
+            let timeout_secs = shutdown_timeout;
             let fut = async move {
                 info!("Shutting down MCP server process: {}", name);
 
@@ -89,7 +131,7 @@ impl ProxyServer {
                     let _ = child.start_kill();
                 }
 
-                match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait()).await {
                     Ok(Ok(status)) => info!("Process {} exited with status: {}", name, status),
                     Ok(Err(e)) => warn!("Error waiting for process {}: {}", name, e),
                     Err(_) => {
@@ -112,7 +154,7 @@ impl ProxyServer {
     }
 
     /// Connect to all configured MCP servers
-    async fn connect_to_all_servers(&self) -> Result<(), String> {
+    async fn connect_to_all_servers(&self) -> Result<()> {
         let connection_futures: Vec<_> = self
             .config
             .mcp_servers
@@ -124,7 +166,7 @@ impl ProxyServer {
                 let process_handles = self.process_handles.clone();
 
                 async move {
-                    match Self::connect_to_server_static(
+                    match Self::connect_to_server_impl(
                         name.clone(),
                         server_config,
                         process_handles,
@@ -179,14 +221,21 @@ impl ProxyServer {
             tracing::info!("No MCP servers configured");
             Ok(())
         } else {
-            Err("Failed to connect to any MCP servers".to_string())
+            Err(ProxyError::config("Failed to connect to any MCP servers"))
         }
     }
 
     /// Populate tools, prompts, and resources for a connected server
     async fn populate_server_capabilities(server: &mut ConnectedServer) {
-        // Fetch tools
-        match server.client.list_tools(None).await {
+        // Fetch all capabilities in parallel
+        let (tools_result, prompts_result, resources_result) = tokio::join!(
+            server.client.list_tools(None),
+            server.client.list_prompts(None),
+            server.client.list_resources(None)
+        );
+
+        // Process tools
+        match tools_result {
             Ok(tools_result) => {
                 server.tools = tools_result.tools;
                 tracing::debug!(
@@ -204,8 +253,8 @@ impl ProxyServer {
             }
         }
 
-        // Fetch prompts
-        match server.client.list_prompts(None).await {
+        // Process prompts
+        match prompts_result {
             Ok(prompts_result) => {
                 server.prompts = prompts_result.prompts;
                 tracing::debug!(
@@ -223,8 +272,8 @@ impl ProxyServer {
             }
         }
 
-        // Fetch resources
-        match server.client.list_resources(None).await {
+        // Process resources
+        match resources_result {
             Ok(resources_result) => {
                 server.resources = resources_result.resources;
                 tracing::debug!(
@@ -244,15 +293,15 @@ impl ProxyServer {
     }
 
     /// Connect to a single server based on its configuration
-    async fn connect_to_server_static(
+    async fn connect_to_server_impl(
         name: String,
         config: ServerConfig,
         process_handles: Arc<RwLock<HashMap<String, Child>>>,
-    ) -> Result<(String, ConnectedServer), String> {
+    ) -> Result<(String, ConnectedServer)> {
         if let Some(stdio_config) = config.as_stdio() {
             tracing::info!("Connecting to stdio server: {}", name);
             let handler = ();
-            Self::connect_stdio_server_static(&name, stdio_config, handler, process_handles)
+            Self::connect_stdio_server(&name, stdio_config, handler, process_handles)
                 .await
                 .map(|client| {
                     let connected = ConnectedServer {
@@ -267,7 +316,7 @@ impl ProxyServer {
         } else if let Some(http_config) = config.as_http() {
             tracing::info!("Connecting to HTTP server: {}", name);
             let handler = ();
-            Self::connect_http_server_static(&name, http_config, handler)
+            Self::connect_http_server(&name, http_config, handler)
                 .await
                 .map(|client| {
                     let connected = ConnectedServer {
@@ -280,19 +329,19 @@ impl ProxyServer {
                     (name, connected)
                 })
         } else {
-            Err(format!(
+            Err(ProxyError::config(format!(
                 "Invalid server configuration for {}: unsupported server type",
                 name
-            ))
+            )))
         }
     }
 
-    async fn connect_stdio_server_static(
+    async fn connect_stdio_server(
         server_name: &str,
         config: StdioConfig,
         handler: (),
         process_handles: Arc<RwLock<HashMap<String, Child>>>,
-    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, String> {
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>> {
         tracing::debug!("Creating stdio transport for server: {}", server_name);
 
         let mut cmd = Command::new(&config.command);
@@ -307,11 +356,12 @@ impl ProxyServer {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("Failed to spawn child process: {}", e))?;
+            .map_err(|e| ProxyError::process_spawn(format!("Failed to spawn child process: {}", e)))?;
 
         let stdout = child.stdout.take().expect("child stdout is piped");
         let stdin = child.stdin.take().expect("child stdin is piped");
 
+        // Store the process handle
         process_handles
             .write()
             .await
@@ -321,30 +371,59 @@ impl ProxyServer {
         let transport = (stdout, stdin);
 
         tracing::debug!("Serving client for server: {}", server_name);
-        let client = handler
-            .serve(transport)
-            .await
-            .map_err(|e| format!("Failed to serve client: {}", e))?;
-
-        tracing::info!("Successfully connected to stdio server: {}", server_name);
-        Ok(client)
+        
+        // Try to connect, but clean up the process if it fails
+        match handler.serve(transport).await {
+            Ok(client) => {
+                tracing::info!("Successfully connected to stdio server: {}", server_name);
+                Ok(client)
+            }
+            Err(e) => {
+                // Connection failed, clean up the spawned process
+                tracing::error!("Failed to connect to stdio server {}: {}", server_name, e);
+                
+                // Remove and kill the process
+                if let Some(mut child) = process_handles.write().await.remove(server_name) {
+                    tracing::info!("Cleaning up failed stdio process for {}", server_name);
+                    let _ = child.kill().await;
+                }
+                
+                Err(ProxyError::connection(server_name, format!("Failed to serve client: {}", e)))
+            }
+        }
     }
 
-    async fn connect_http_server_static(
+    async fn connect_http_server(
         server_name: &str,
         config: HttpConfig,
         handler: (),
-    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, String> {
+    ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>> {
         tracing::debug!("Creating HTTP transport for server: {}", server_name);
 
         let uri: Arc<str> = Arc::from(config.url.as_str());
         let transport = StreamableHttpClientTransport::from_uri(uri);
+        
+        // Configure authorization if provided
+        if !config.authorization_token.is_empty() {
+            tracing::debug!("Configuring authorization for server: {}", server_name);
+            // TODO: Once rmcp supports it, set authorization header here
+            // transport.set_authorization(&config.authorization_token);
+        }
+        
+        // Configure additional headers if provided  
+        if !config.headers.is_empty() {
+            tracing::debug!("Configuring {} custom headers for server: {}", config.headers.len(), server_name);
+            // TODO: Once rmcp supports it, set custom headers here
+            // for (key, value) in &config.headers {
+            //     transport.add_header(key, value);
+            // }
+        }
 
         tracing::debug!("Serving client for server: {}", server_name);
         let client = handler
             .serve(transport)
             .await
-            .map_err(|e| format!("Failed to serve HTTP client: {}", e))?;
+            .map_err(|e| ProxyError::connection(server_name, format!("Failed to serve HTTP client: {}", e)))?;
 
         tracing::info!("Successfully connected to HTTP server: {}", server_name);
         Ok(client)
@@ -360,7 +439,7 @@ impl ProxyServer {
                 Ok(tools_result) => {
                     for mut tool in tools_result.tools {
                         // Prefix tool names with server name to avoid conflicts
-                        tool.name = format!("{}___{}", server_name, tool.name).into();
+                        tool.name = Self::prefix_with_server(server_name, &tool.name).into();
                         all_tools.push(tool);
                     }
                 }
@@ -383,7 +462,7 @@ impl ProxyServer {
                 Ok(prompts_result) => {
                     for mut prompt in prompts_result.prompts {
                         // Prefix prompt names with server name for disambiguation
-                        prompt.name = format!("{}___{}", server_name, prompt.name);
+                        prompt.name = Self::prefix_with_server(server_name, &prompt.name);
                         all_prompts.push(prompt);
                     }
                 }
@@ -406,7 +485,7 @@ impl ProxyServer {
                 Ok(resources_result) => {
                     for mut resource in resources_result.resources {
                         // Prefix resource URIs with server name for disambiguation
-                        resource.uri = format!("{}___{}", server_name, resource.uri);
+                        resource.uri = Self::prefix_with_server(server_name, &resource.uri);
                         all_resources.push(resource);
                     }
                 }
@@ -428,23 +507,14 @@ impl ProxyServer {
         &self,
         tool_name: &str,
         arguments: Option<JsonObject>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         // Parse the prefixed tool name (format: "server_name___tool_name")
-        let (server_name, actual_tool_name) = if let Some(pos) = tool_name.find("___") {
-            let server_name = &tool_name[..pos];
-            let tool_name = &tool_name[pos + 3..];  // Skip the 3 underscores
-            (server_name, tool_name)
-        } else {
-            return Err(McpError::invalid_params(
-                format!("Invalid tool name format: {}", tool_name),
-                None,
-            ));
-        };
+        let (server_name, actual_tool_name) = Self::extract_server_and_name(tool_name)?;
 
         let servers = self.servers.read().await;
         let server = servers
             .get(server_name)
-            .ok_or_else(|| McpError::invalid_params(format!("Server not found: {}", server_name), None))?;
+            .ok_or_else(|| ProxyError::server_not_found(server_name))?;
 
         // Call the tool on the specific server
         let param = CallToolRequestParam {
@@ -481,7 +551,7 @@ impl ServerHandler for ProxyServer {
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, McpError> {
+    ) -> std::result::Result<ListToolsResult, McpError> {
         let tools = self.get_all_tools().await;
         Ok(ListToolsResult {
             tools,
@@ -493,72 +563,30 @@ impl ServerHandler for ProxyServer {
         &self,
         request: CallToolRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> std::result::Result<CallToolResult, McpError> {
         self.call_tool_on_server(&request.name, request.arguments)
             .await
     }
 
     async fn list_prompts(
         &self,
-        request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, McpError> {
-        let mut all_prompts = Vec::new();
-        let servers = self.servers.read().await;
-
-        for (server_name, server) in servers.iter() {
-            match server.client.list_prompts(request.clone()).await {
-                Ok(prompts_result) => {
-                    for mut prompt in prompts_result.prompts {
-                        // Prefix prompt names with server name for disambiguation
-                        prompt.name = format!("{}___{}", server_name, prompt.name);
-                        all_prompts.push(prompt);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to list prompts from server '{}': {}", server_name, e);
-                    // Continue with other servers
-                }
-            }
-        }
-
+    ) -> std::result::Result<ListPromptsResult, McpError> {
         Ok(ListPromptsResult {
-            prompts: all_prompts,
-            next_cursor: None, // TODO: Implement proper pagination
+            prompts: self.get_all_prompts().await,
+            next_cursor: None,
         })
     }
 
     async fn list_resources(
         &self,
-        request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, McpError> {
-        let mut all_resources = Vec::new();
-        let servers = self.servers.read().await;
-
-        for (server_name, server) in servers.iter() {
-            match server.client.list_resources(request.clone()).await {
-                Ok(resources_result) => {
-                    for mut resource in resources_result.resources {
-                        // Prefix resource URIs with server name for disambiguation
-                        resource.uri = format!("{}___{}", server_name, resource.uri);
-                        all_resources.push(resource);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to list resources from server '{}': {}",
-                        server_name,
-                        e
-                    );
-                    // Continue with other servers
-                }
-            }
-        }
-
+    ) -> std::result::Result<ListResourcesResult, McpError> {
         Ok(ListResourcesResult {
-            resources: all_resources,
-            next_cursor: None, // TODO: Implement proper pagination
+            resources: self.get_all_resources().await,
+            next_cursor: None,
         })
     }
 } 

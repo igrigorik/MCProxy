@@ -1,5 +1,6 @@
 //! Configuration management for the MCP proxy.
 
+use crate::error::{ProxyError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -12,53 +13,28 @@ pub struct McpConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)] // Infer transport from fields: command = stdio, url = http
+#[serde(untagged)]
 pub enum ServerConfig {
-    Stdio(StdioConfig),
-    Http(HttpConfig),
-    TypedStdio(TypedStdioConfig),
-    TypedHttp(TypedHttpConfig),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StdioConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HttpConfig {
-    pub url: String,
-    #[serde(default, rename = "authorizationToken")]
-    pub authorization_token: String,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TypedStdioConfig {
-    #[serde(rename = "type")]
-    pub server_type: String,
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TypedHttpConfig {
-    #[serde(rename = "type")]
-    pub server_type: String,
-    #[serde(alias = "command")] // Support both "url" and "command" for HTTP URLs
-    pub url: String,
-    #[serde(default, rename = "authorizationToken")]
-    pub authorization_token: String,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+    // Matches when "command" field is present (stdio transport)
+    Stdio {
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        server_type: Option<String>,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+    },
+    // Matches when "url" field is present (http transport)
+    Http {
+        #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+        server_type: Option<String>,
+        url: String,
+        #[serde(default, rename = "authorizationToken")]
+        authorization_token: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Configuration for the HTTP server that serves the MCP proxy
@@ -79,6 +55,10 @@ pub struct HttpServerConfig {
     /// List of allowed CORS origins (default: ["*"] for development)
     #[serde(default = "default_cors_origins", rename = "corsOrigins")]
     pub cors_origins: Vec<String>,
+    
+    /// Timeout in seconds for graceful shutdown (default: 5)
+    #[serde(default = "default_shutdown_timeout", rename = "shutdownTimeout")]
+    pub shutdown_timeout: u64,
 }
 
 fn default_host() -> String {
@@ -97,6 +77,10 @@ fn default_cors_origins() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_shutdown_timeout() -> u64 {
+    5
+}
+
 impl Default for HttpServerConfig {
     fn default() -> Self {
         Self {
@@ -104,51 +88,57 @@ impl Default for HttpServerConfig {
             port: default_port(),
             cors_enabled: default_cors_enabled(),
             cors_origins: default_cors_origins(),
+            shutdown_timeout: default_shutdown_timeout(),
         }
     }
 }
 
+// Re-export for backward compatibility
+pub type StdioConfig = StdioTransportConfig;
+pub type HttpConfig = HttpTransportConfig;
+
+#[derive(Clone, Debug)]
+pub struct StdioTransportConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpTransportConfig {
+    pub url: String,
+    pub authorization_token: String,
+    pub headers: HashMap<String, String>,
+}
+
 impl ServerConfig {
-    pub fn as_stdio(&self) -> Option<StdioConfig> {
+    pub fn as_stdio(&self) -> Option<StdioTransportConfig> {
         match self {
-            ServerConfig::Stdio(config) => Some(config.clone()),
-            ServerConfig::TypedStdio(config) => {
-                if config.server_type == "stdio" {
-                    Some(StdioConfig {
-                        command: config.command.clone(),
-                        args: config.args.clone(),
-                        env: config.env.clone(),
-                    })
-                } else {
-                    None
-                }
-            }
+            ServerConfig::Stdio { command, args, env, .. } => Some(StdioTransportConfig {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+            }),
             _ => None,
         }
     }
 
-    pub fn as_http(&self) -> Option<HttpConfig> {
+    pub fn as_http(&self) -> Option<HttpTransportConfig> {
         match self {
-            ServerConfig::Http(config) => Some(config.clone()),
-            ServerConfig::TypedHttp(config) => {
-                if config.server_type == "http" {
-                    Some(HttpConfig {
-                        url: config.url.clone(),
-                        authorization_token: config.authorization_token.clone(),
-                        headers: config.headers.clone(),
-                    })
-                } else {
-                    None
-                }
-            }
+            ServerConfig::Http { url, authorization_token, headers, .. } => Some(HttpTransportConfig {
+                url: url.clone(),
+                authorization_token: authorization_token.clone(),
+                headers: headers.clone(),
+            }),
             _ => None,
         }
     }
 }
 
 /// Load configuration from a JSON file
-pub fn load_config(path: &str) -> Result<McpConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let content = std::fs::read_to_string(path)?;
+pub fn load_config(path: &str) -> Result<McpConfig> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| ProxyError::config(format!("Failed to read config file '{}': {}", path, e)))?;
     let mut config: McpConfig = serde_json::from_str(&content)?;
     
     // Ensure HTTP server config exists with defaults
@@ -198,7 +188,7 @@ mod tests {
         assert!(config.mcp_servers.contains_key("http-server"));
 
         // Test stdio server config
-        if let ServerConfig::Stdio(stdio) = &config.mcp_servers["stdio-server"] {
+        if let Some(stdio) = config.mcp_servers["stdio-server"].as_stdio() {
             assert_eq!(stdio.command, "my-command");
             assert_eq!(stdio.args, vec!["arg1", "arg2"]);
             assert_eq!(stdio.env.get("VAR1"), Some(&"VALUE1".to_string()));
@@ -207,7 +197,7 @@ mod tests {
         }
 
         // Test HTTP server config
-        if let ServerConfig::Http(http) = &config.mcp_servers["http-server"] {
+        if let Some(http) = config.mcp_servers["http-server"].as_http() {
             assert_eq!(http.url, "http://localhost:8080");
             assert_eq!(http.authorization_token, "bearer-token");
             assert_eq!(http.headers.get("Authorization"), Some(&"Bearer test-token".to_string()));
@@ -239,7 +229,7 @@ mod tests {
         let config: McpConfig = serde_json::from_str(json_data).expect("Failed to parse config");
 
         // Test defaults for stdio
-        if let ServerConfig::Stdio(stdio) = &config.mcp_servers["minimal-stdio"] {
+        if let Some(stdio) = config.mcp_servers["minimal-stdio"].as_stdio() {
             assert_eq!(stdio.command, "echo");
             assert!(stdio.args.is_empty());
             assert!(stdio.env.is_empty());
@@ -248,7 +238,7 @@ mod tests {
         }
 
         // Test defaults for HTTP
-        if let ServerConfig::Http(http) = &config.mcp_servers["minimal-http"] {
+        if let Some(http) = config.mcp_servers["minimal-http"].as_http() {
             assert_eq!(http.url, "http://localhost:8080");
             assert!(http.authorization_token.is_empty());
             assert!(http.headers.is_empty());

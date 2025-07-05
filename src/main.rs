@@ -1,248 +1,101 @@
-use std::{env, net::SocketAddr, sync::Arc};
+//! MCP (Model Context Protocol) Proxy Server
+//! 
+//! This application acts as a proxy that aggregates multiple MCP servers and exposes
+//! them through a single HTTP endpoint. It supports both stdio (subprocess) and HTTP
+//! MCP servers as backends.
+//! 
+//! # Architecture
+//! 
+//! The proxy consists of several key components:
+//! 
+//! - **Main Module**: Entry point and application lifecycle management
+//! - **Config Module**: Configuration management with environment variable support
+//! - **Error Module**: Centralized error handling with `ProxyError` type
+//! - **HTTP Server Module**: HTTP/JSON-RPC server implementation
+//! - **Proxy Module**: Core proxy logic for aggregating MCP servers
+//! 
+//! # Usage
+//! 
+//! ```bash
+//! mcproxy <config_file>
+//! ```
+//! 
+//! The configuration file should be in JSON format specifying the MCP servers to
+//! connect to and HTTP server settings.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use std::{env, sync::Arc};
+
 use config::load_config;
 use proxy::ProxyServer;
-use rmcp::{
-    model::*,
-    Error as McpError,
-    ServerHandler,
-};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 mod config;
+mod error;
+mod http_server;
 mod proxy;
 
-type SharedProxyServer = Arc<ProxyServer>;
-
-/// JSON-RPC 2.0 request structure
-#[derive(Debug, Clone, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<Value>,
-    method: String,
-    params: Option<Value>,
-}
-
-/// JSON-RPC 2.0 response structure  
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-/// JSON-RPC 2.0 error structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-}
-
-impl JsonRpcResponse {
-    fn success(id: Option<Value>, result: Value) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: Some(result),
-            error: None,
-        }
+/// Apply environment variable overrides to the configuration
+fn apply_env_overrides(config: &mut config::McpConfig) {
+    // Ensure HTTP server config exists
+    if config.http_server.is_none() {
+        config.http_server = Some(config::HttpServerConfig::default());
     }
     
-    fn error(id: Option<Value>, error: JsonRpcError) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: None,
-            error: Some(error),
+    if let Some(http_config) = config.http_server.as_mut() {
+        // Override host if MCPROXY_HTTP_HOST is set
+        if let Ok(host) = env::var("MCPROXY_HTTP_HOST") {
+            info!("Overriding HTTP host from environment: {}", host);
+            http_config.host = host;
+        }
+        
+        // Override port if MCPROXY_HTTP_PORT is set
+        if let Ok(port_str) = env::var("MCPROXY_HTTP_PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                info!("Overriding HTTP port from environment: {}", port);
+                http_config.port = port;
+            } else {
+                warn!("Invalid MCPROXY_HTTP_PORT value: {}", port_str);
+            }
+        }
+        
+        // Override CORS enabled if MCPROXY_CORS_ENABLED is set
+        if let Ok(cors_str) = env::var("MCPROXY_CORS_ENABLED") {
+            match cors_str.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => {
+                    info!("Enabling CORS from environment");
+                    http_config.cors_enabled = true;
+                }
+                "false" | "0" | "no" | "off" => {
+                    info!("Disabling CORS from environment");
+                    http_config.cors_enabled = false;
+                }
+                _ => warn!("Invalid MCPROXY_CORS_ENABLED value: {}", cors_str),
+            }
+        }
+        
+        // Override CORS origins if MCPROXY_CORS_ORIGINS is set
+        if let Ok(origins_str) = env::var("MCPROXY_CORS_ORIGINS") {
+            let origins: Vec<String> = origins_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !origins.is_empty() {
+                info!("Overriding CORS origins from environment: {:?}", origins);
+                http_config.cors_origins = origins;
+            }
+        }
+        
+        // Override shutdown timeout if MCPROXY_SHUTDOWN_TIMEOUT is set
+        if let Ok(timeout_str) = env::var("MCPROXY_SHUTDOWN_TIMEOUT") {
+            if let Ok(timeout) = timeout_str.parse::<u64>() {
+                info!("Overriding shutdown timeout from environment: {} seconds", timeout);
+                http_config.shutdown_timeout = timeout;
+            } else {
+                warn!("Invalid MCPROXY_SHUTDOWN_TIMEOUT value: {}", timeout_str);
+            }
         }
     }
-}
-
-impl From<McpError> for JsonRpcError {
-    fn from(error: McpError) -> Self {
-        Self {
-            code: error.code.0,
-            message: error.message.to_string(),
-            data: error.data,
-        }
-    }
-}
-
-/// Fully compliant MCP endpoint that handles JSON-RPC 2.0 requests
-async fn mcp_handler(
-    State(proxy): State<SharedProxyServer>,
-    Json(request): Json<Value>,
-) -> Result<Json<JsonRpcResponse>, StatusCode> {
-    // Parse JSON-RPC request
-    let json_rpc_request: JsonRpcRequest = match serde_json::from_value(request) {
-        Ok(req) => req,
-        Err(e) => {
-            warn!("Invalid JSON-RPC request: {}", e);
-            let response = JsonRpcResponse::error(
-                None,
-                JsonRpcError {
-                    code: -32700, // Parse error
-                    message: "Parse error".to_string(), 
-                    data: Some(serde_json::json!({ "details": e.to_string() })),
-                },
-            );
-            return Ok(Json(response));
-        }
-    };
-
-    // Validate JSON-RPC version
-    if json_rpc_request.jsonrpc != "2.0" {
-        let response = JsonRpcResponse::error(
-            json_rpc_request.id,
-            JsonRpcError {
-                code: -32600, // Invalid Request
-                message: "Invalid Request".to_string(),
-                data: Some(serde_json::json!({ "details": "Only JSON-RPC 2.0 is supported" })),
-            },
-        );
-        return Ok(Json(response));
-    }
-
-    tracing::debug!("Processing MCP request: {} (id: {:?})", json_rpc_request.method, json_rpc_request.id);
-
-    // Route MCP method to appropriate handler
-    let result = route_mcp_method(&proxy, json_rpc_request.method.as_str(), json_rpc_request.params).await;
-    
-    let response = match result {
-        Ok(result) => JsonRpcResponse::success(json_rpc_request.id, result),
-        Err(error) => JsonRpcResponse::error(json_rpc_request.id, error.into()),
-    };
-
-    Ok(Json(response))
-}
-
-/// Route MCP method calls to the appropriate ProxyServer handlers
-async fn route_mcp_method(
-    proxy: &ProxyServer,
-    method: &str,
-    params: Option<Value>,
-) -> Result<Value, McpError> {
-    // For HTTP endpoints, we call the ServerHandler methods directly
-    // rather than going through the full MCP request context
-
-    match method {
-        "initialize" => {
-            let _init_params: InitializeRequestParam = if let Some(params) = params {
-                serde_json::from_value(params)
-                    .map_err(|e| McpError::invalid_params(format!("Invalid initialize params: {}", e), None))?
-            } else {
-                return Err(McpError::invalid_params("Missing initialize params", None));
-            };
-            
-            let result = proxy.get_info();
-            serde_json::to_value(result).map_err(|e| McpError::internal_error(
-                format!("Failed to serialize result: {}", e), None
-            ))
-        }
-        
-        "ping" => {
-            // Ping just returns an empty object
-            Ok(serde_json::json!({}))
-        }
-        
-        "tools/list" => {
-            let _list_params: Option<PaginatedRequestParam> = if let Some(params) = params {
-                Some(serde_json::from_value(params)
-                    .map_err(|e| McpError::invalid_params(format!("Invalid tools/list params: {}", e), None))?)
-            } else {
-                None
-            };
-            
-            // Get tools directly without context
-            let tools = proxy.get_all_tools().await;
-            let result = ListToolsResult {
-                tools,
-                next_cursor: None,
-            };
-            serde_json::to_value(result).map_err(|e| McpError::internal_error(
-                format!("Failed to serialize result: {}", e), None
-            ))
-        }
-        
-        "tools/call" => {
-            let call_params: CallToolRequestParam = if let Some(params) = params {
-                serde_json::from_value(params)
-                    .map_err(|e| McpError::invalid_params(format!("Invalid tools/call params: {}", e), None))?
-            } else {
-                return Err(McpError::invalid_params("Missing tools/call params", None));
-            };
-            
-            let result = proxy.call_tool_on_server(&call_params.name, call_params.arguments).await?;
-            serde_json::to_value(result).map_err(|e| McpError::internal_error(
-                format!("Failed to serialize result: {}", e), None
-            ))
-        }
-        
-        "prompts/list" => {
-            let _list_params: Option<PaginatedRequestParam> = if let Some(params) = params {
-                Some(serde_json::from_value(params)
-                    .map_err(|e| McpError::invalid_params(format!("Invalid prompts/list params: {}", e), None))?)
-            } else {
-                None
-            };
-            
-            let prompts = proxy.get_all_prompts().await;
-            let result = ListPromptsResult {
-                prompts,
-                next_cursor: None,
-            };
-            serde_json::to_value(result).map_err(|e| McpError::internal_error(
-                format!("Failed to serialize result: {}", e), None
-            ))
-        }
-        
-        "resources/list" => {
-            let _list_params: Option<PaginatedRequestParam> = if let Some(params) = params {
-                Some(serde_json::from_value(params)
-                    .map_err(|e| McpError::invalid_params(format!("Invalid resources/list params: {}", e), None))?)
-            } else {
-                None
-            };
-            
-            let resources = proxy.get_all_resources().await;
-            let result = ListResourcesResult {
-                resources,
-                next_cursor: None,
-            };
-            serde_json::to_value(result).map_err(|e| McpError::internal_error(
-                format!("Failed to serialize result: {}", e), None
-            ))
-        }
-        
-        _ => {
-            warn!("Unknown MCP method: {}", method);
-            Err(McpError::invalid_params(format!("Unknown method: {}", method), None))
-        }
-    }
-}
-
-
-
-async fn health_check() -> Json<Value> {
-    Json(serde_json::json!({
-        "status": "healthy",
-        "service": "mcproxy"
-    }))
 }
 
 #[tokio::main]
@@ -271,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let config_path = &args[1];
-    let config = load_config(config_path)?;
+    let mut config = load_config(config_path)?;
+    
+    // Apply environment variable overrides
+    apply_env_overrides(&mut config);
 
     // Create the proxy server and connect to all MCP servers
     info!("Connecting to {} MCP servers...", config.mcp_servers.len());
@@ -284,51 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .as_ref()
         .ok_or("HTTP server configuration is required")?;
 
-    // Convert hostname to IP address for SocketAddr parsing
-    let host_ip = if http_config.host == "localhost" {
-        "127.0.0.1"
-    } else {
-        &http_config.host
-    };
-    
-    let bind_address_str = format!("{}:{}", host_ip, http_config.port);
-    info!("Parsed HTTP config - host: '{}', port: {}, bind_address: '{}'", 
-          http_config.host, http_config.port, bind_address_str);
-
-    let bind_addr: SocketAddr = bind_address_str
-        .parse()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address_str, e))?;
-
+    let bind_addr = http_server::parse_bind_address(http_config)?;
     info!("Binding HTTP server to {}", bind_addr);
 
-    // Configure CORS based on config
-    let cors = if http_config.cors_enabled {
-        let mut cors_layer = CorsLayer::new();
-        
-        if http_config.cors_origins.contains(&"*".to_string()) {
-            cors_layer = cors_layer.allow_origin(Any);
-        } else {
-            // Parse allowed origins from config
-            for origin in &http_config.cors_origins {
-                if let Ok(header_value) = origin.parse::<axum::http::HeaderValue>() {
-                    cors_layer = cors_layer.allow_origin(header_value);
-                }
-            }
-        }
-        
-        cors_layer
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
-            .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
-    } else {
-        CorsLayer::new()
-    };
-
-    // Create HTTP server using axum
-    let app = Router::new()
-        .route("/mcp", post(mcp_handler))
-        .route("/health", axum::routing::get(health_check))
-        .layer(cors)
-        .with_state(shared_proxy.clone());
+    // Create HTTP server using the http_server module
+    let app = http_server::create_router(shared_proxy.clone(), http_config);
 
     info!("🚀 MCP Proxy HTTP Server listening on http://{}", bind_addr);
     info!("   📡 MCP endpoint: http://{}/mcp", bind_addr);
@@ -385,46 +201,109 @@ mod tests {
     use axum::{
         body::Body,
         http::{header, Method, Request, StatusCode},
+        Router,
     };
     use http_body_util::BodyExt;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::collections::HashMap;
     use tower::ServiceExt;
+    
+    /// Test fixture builder for creating test configurations and apps
+    struct TestFixture {
+        config: McpConfig,
+    }
+    
+    impl TestFixture {
+        /// Create a new test fixture builder
+        fn builder() -> TestFixtureBuilder {
+            TestFixtureBuilder::default()
+        }
+        
+        /// Build a test app from this fixture
+        async fn build_app(self) -> Router {
+            let proxy = ProxyServer::new(self.config).await.unwrap();
+            create_test_app(proxy).await
+        }
+    }
+    
+    #[derive(Default)]
+    struct TestFixtureBuilder {
+        mcp_servers: HashMap<String, config::ServerConfig>,
+        host: Option<String>,
+        port: Option<u16>,
+        cors_enabled: Option<bool>,
+        cors_origins: Option<Vec<String>>,
+        shutdown_timeout: Option<u64>,
+    }
+    
+    impl TestFixtureBuilder {
+        #[allow(dead_code)]
+        fn with_server(mut self, name: &str, config: config::ServerConfig) -> Self {
+            self.mcp_servers.insert(name.to_string(), config);
+            self
+        }
+        
+        #[allow(dead_code)]
+        fn with_host(mut self, host: &str) -> Self {
+            self.host = Some(host.to_string());
+            self
+        }
+        
+        #[allow(dead_code)]
+        fn with_port(mut self, port: u16) -> Self {
+            self.port = Some(port);
+            self
+        }
+        
+        #[allow(dead_code)]
+        fn with_cors(mut self, enabled: bool, origins: Vec<&str>) -> Self {
+            self.cors_enabled = Some(enabled);
+            self.cors_origins = Some(origins.into_iter().map(|s| s.to_string()).collect());
+            self
+        }
+        
+        #[allow(dead_code)]
+        fn with_shutdown_timeout(mut self, timeout: u64) -> Self {
+            self.shutdown_timeout = Some(timeout);
+            self
+        }
+        
+        fn build(self) -> TestFixture {
+            let config = McpConfig {
+                mcp_servers: self.mcp_servers,
+                http_server: Some(config::HttpServerConfig {
+                    host: self.host.unwrap_or_else(|| "127.0.0.1".to_string()),
+                    port: self.port.unwrap_or(0),
+                    cors_enabled: self.cors_enabled.unwrap_or(true),
+                    cors_origins: self.cors_origins.unwrap_or_else(|| vec!["*".to_string()]),
+                    shutdown_timeout: self.shutdown_timeout.unwrap_or(5),
+                }),
+            };
+            TestFixture { config }
+        }
+    }
 
     /// Create a test configuration
     fn create_test_config() -> McpConfig {
-        McpConfig {
-            mcp_servers: HashMap::new(),
-            http_server: Some(config::HttpServerConfig {
-                host: "127.0.0.1".to_string(),
-                port: 0, // Use random port for testing
-                cors_enabled: true,
-                cors_origins: vec!["*".to_string()],
-            }),
-        }
+        TestFixture::builder().build().config
     }
 
     /// Helper to create a test app with proxy server
     async fn create_test_app(proxy: ProxyServer) -> Router {
         let shared_proxy = Arc::new(proxy);
-
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
-
-        Router::new()
-            .route("/mcp", post(mcp_handler))
-            .route("/health", axum::routing::get(health_check))
-            .layer(cors)
-            .with_state(shared_proxy)
+        let test_config = config::HttpServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            cors_enabled: true,
+            cors_origins: vec!["*".to_string()],
+            shutdown_timeout: 5,
+        };
+        http_server::create_router(shared_proxy, &test_config)
     }
 
     /// Helper to create a test app with default config
     async fn create_default_test_app() -> Router {
-        let config = create_test_config();
-        let proxy = ProxyServer::new(config).await.unwrap();
-        create_test_app(proxy).await
+        TestFixture::builder().build().build_app().await
     }
 
     #[tokio::test]
@@ -510,11 +389,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert!(body.error.is_some());
-        assert_eq!(body.error.unwrap().code, -32600); // Invalid Request
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert!(body["error"].is_object());
+        assert_eq!(body["error"]["code"], -32600); // Invalid Request
     }
 
     #[tokio::test]
@@ -538,12 +417,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
     }
 
     #[tokio::test]
@@ -580,15 +459,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
 
         // Verify the result contains server info
-        let result = body.result.unwrap();
+        let result = &body["result"];
         assert!(result.get("protocolVersion").is_some());
         assert!(result.get("capabilities").is_some());
         assert!(result.get("serverInfo").is_some());
@@ -615,15 +494,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
 
         // Verify the result has the expected structure
-        let result = body.result.unwrap();
+        let result = &body["result"];
         assert!(result.get("tools").is_some());
         // Note: next_cursor is None when there are no more results, so it's omitted from JSON
     }
@@ -649,13 +528,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_none());
-        assert!(body.error.is_some());
-        assert_eq!(body.error.unwrap().code, -32602); // Invalid params
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body.get("result").is_none());
+        assert!(body["error"].is_object());
+        assert_eq!(body["error"]["code"], -32602); // Invalid params
     }
 
     #[tokio::test]
@@ -679,13 +558,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_none());
-        assert!(body.error.is_some());
-        assert_eq!(body.error.unwrap().code, -32602); // Invalid params (our current implementation)
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body.get("result").is_none());
+        assert!(body["error"].is_object());
+        assert_eq!(body["error"]["code"], -32602); // Invalid params (our current implementation)
     }
 
     #[tokio::test]
@@ -709,15 +588,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
 
         // Verify the result has the expected structure
-        let result = body.result.unwrap();
+        let result = &body["result"];
         assert!(result.get("prompts").is_some());
         // Note: next_cursor is None when there are no more results, so it's omitted from JSON
     }
@@ -743,17 +622,152 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, Some(json!(1)));
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
 
         // Verify the result has the expected structure
-        let result = body.result.unwrap();
+        let result = &body["result"];
         assert!(result.get("resources").is_some());
         // Note: next_cursor is None when there are no more results, so it's omitted from JSON
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_empty_name() {
+        let app = create_default_test_app().await;
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "",
+                "arguments": {}
+            }
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body.get("result").is_none());
+        assert!(body["error"].is_object());
+        // Should get invalid format error
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_invalid_format() {
+        let app = create_default_test_app().await;
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "invalid_tool_name_without_prefix",
+                "arguments": {}
+            }
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body.get("result").is_none());
+        assert!(body["error"].is_object());
+        // Should get invalid format error
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_server_not_found() {
+        let app = create_default_test_app().await;
+
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "nonexistent_server___some_tool",
+                "arguments": {}
+            }
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body.get("result").is_none());
+        assert!(body["error"].is_object());
+        // Should get server not found error
+    }
+
+    #[tokio::test]
+    async fn test_empty_config_no_servers() {
+        // Test that proxy works even with no servers configured
+        let fixture = TestFixture::builder().build();
+        let app = fixture.build_app().await;
+
+        // Test tools/list returns empty array
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        });
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&request_body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(body["result"].is_object());
+        assert!(body["result"]["tools"].is_array());
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -776,12 +790,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body: JsonRpcResponse = serde_json::from_slice(&body).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         
-        assert_eq!(body.jsonrpc, "2.0");
-        assert_eq!(body.id, None);
-        assert!(body.result.is_some());
-        assert!(body.error.is_none());
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert!(body.get("id").is_none() || body["id"].is_null());
+        assert!(body["result"].is_object());
+        assert!(body.get("error").is_none());
     }
 
 

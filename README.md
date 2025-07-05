@@ -1,30 +1,49 @@
 # MCP Proxy
 
-An efficient, Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multiple upstream servers and exposes them through a single `stdio` interface.
+Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multiple upstream servers and exposes them through a single streamable HTTP interface.
 
-## Features
-
-- **Tool Aggregation**: Connects to multiple upstream MCP servers (via `stdio` or `http`) and exposes an aggregated list of all their tools.
-- **Dynamic Tool Updates**: Listens for `toolListChanged` notifications from upstream servers and dynamically updates its aggregated tool list.
-- **Structured Logging**: Uses `tracing` to emit structured JSON logs for observability.
-- **Concurrent Connections**: Connects to all configured upstream servers concurrently for fast startup.
+- **Tool aggregation**: Connects to multiple upstream MCP servers (via `stdio` or `http`) and exposes an aggregated list of all their tools.
+- **Dynamic tool updates**: Listens for `toolListChanged` notifications from upstream servers and dynamically updates its aggregated tool list.
 
 ## Configuration
 
-The proxy is configured using a JSON file (e.g., `mcp_servers.json`) passed as a command-line argument. The file should contain a single object with an `mcpServers` key.
-
-### Example `mcp_servers.json`:
+The proxy is configured using a JSON file passed as a command-line argument. The file should contain a single object with an `mcpServers` key — i.e. same file you already use to configure VSCode/Cursor/Claude/etc. 
 
 ```json
 {
   "mcpServers": {
-    "git-tools": {
-      "command": "uvx",
-      "args": ["mcp-git-ingest"]
+    "stdio-mcp-service": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["script.js"],
+      "env": {
+        "ENV_FOO_VAR": "BAR"
+      }
     },
-    "github": {
+    "http-mcp-github": {
       "url": "https://api.githubcopilot.com/mcp/",
-      "authorizationToken": "Bearer ghp_1234567890"
+      "authorizationToken": "Bearer GitHUB_PAT_TOKEN"
+    }
+  },
+    "httpServer": {
+    "host": "127.0.0.1",
+    "port": 8081,
+    "corsEnabled": true,
+    "corsOrigins": [
+      "*"
+    ]
+  }
+}
+```
+
+In example above, we are aggregating tools from a local (stdio) MCP server and remote (HTTP) MCP server and exposing it on `http://127.0.0.1:8081/mcp` endpoint. To access these tools, we can configure the MCP client with:
+
+```json
+{
+  "mcpServers": {
+    "tool-proxy": {
+      "type": "http",
+      "url": "http://127.0.0.1:8081/mcp"
     }
   }
 }
@@ -55,8 +74,3 @@ The proxy is configured using a JSON file (e.g., `mcp_servers.json`) passed as a
     ./target/release/mcproxy mcp_servers.json
     ```
     The proxy will start, connect to the configured servers, and listen for MCP messages on its `stdio`.
-
-## Development
-
--   **Logging**: The application uses the `RUST_LOG` environment variable to control log levels (e.g., `RUST_LOG=info,mcproxy=debug`).
--   **Testing**: Run tests with `cargo test`. 
