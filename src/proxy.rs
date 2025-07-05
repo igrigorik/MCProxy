@@ -351,12 +351,16 @@ impl ProxyServer {
         #[cfg(unix)]
         cmd.process_group(0);
 
+        tracing::info!("Spawning process for {}: {} {:?}", server_name, &config.command, &config.args);
+
         let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| ProxyError::process_spawn(format!("Failed to spawn child process: {}", e)))?;
+
+        tracing::debug!("Process spawned successfully for {}, PID: {:?}", server_name, child.id());
 
         let stdout = child.stdout.take().expect("child stdout is piped");
         let stdin = child.stdin.take().expect("child stdin is piped");
@@ -508,8 +512,13 @@ impl ProxyServer {
         tool_name: &str,
         arguments: Option<JsonObject>,
     ) -> std::result::Result<CallToolResult, McpError> {
+        tracing::info!("Routing tool call: {}", tool_name);
+        tracing::debug!("Tool arguments: {:?}", arguments);
+        
         // Parse the prefixed tool name (format: "server_name___tool_name")
         let (server_name, actual_tool_name) = Self::extract_server_and_name(tool_name)?;
+        
+        tracing::info!("Extracted server: {}, tool: {}", server_name, actual_tool_name);
 
         let servers = self.servers.read().await;
         let server = servers
@@ -522,11 +531,19 @@ impl ProxyServer {
             arguments,
         };
 
-        server
-            .client
-            .call_tool(param)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Failed to call tool on server {}: {}", server_name, e), None))
+        tracing::info!("Calling tool '{}' on server '{}'", actual_tool_name, server_name);
+        
+        match server.client.call_tool(param).await {
+            Ok(result) => {
+                tracing::info!("Tool call successful for '{}' on server '{}'", actual_tool_name, server_name);
+                tracing::debug!("Tool result: {:?}", result);
+                Ok(result)
+            }
+            Err(e) => {
+                tracing::error!("Tool call failed for '{}' on server '{}': {}", actual_tool_name, server_name, e);
+                Err(McpError::internal_error(format!("Failed to call tool on server {}: {}", server_name, e), None))
+            }
+        }
     }
 }
 
