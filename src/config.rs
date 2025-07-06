@@ -32,8 +32,6 @@ pub enum ServerConfig {
         url: String,
         #[serde(default, rename = "authorizationToken")]
         authorization_token: String,
-        #[serde(default)]
-        headers: HashMap<String, String>,
     },
 }
 
@@ -108,7 +106,6 @@ pub struct StdioTransportConfig {
 pub struct HttpTransportConfig {
     pub url: String,
     pub authorization_token: String,
-    pub headers: HashMap<String, String>,
 }
 
 impl ServerConfig {
@@ -125,10 +122,9 @@ impl ServerConfig {
 
     pub fn as_http(&self) -> Option<HttpTransportConfig> {
         match self {
-            ServerConfig::Http { url, authorization_token, headers, .. } => Some(HttpTransportConfig {
+            ServerConfig::Http { url, authorization_token, .. } => Some(HttpTransportConfig {
                 url: url.clone(),
                 authorization_token: authorization_token.clone(),
-                headers: headers.clone(),
             }),
             _ => None,
         }
@@ -167,11 +163,7 @@ mod tests {
             },
             "http-server": {
               "url": "http://localhost:8080",
-              "authorizationToken": "bearer-token",
-              "headers": {
-                "Authorization": "Bearer test-token",
-                "X-Custom-Header": "custom-value"
-              }
+              "authorizationToken": "bearer-token"
             }
           },
           "httpServer": {
@@ -200,7 +192,6 @@ mod tests {
         if let Some(http) = config.mcp_servers["http-server"].as_http() {
             assert_eq!(http.url, "http://localhost:8080");
             assert_eq!(http.authorization_token, "bearer-token");
-            assert_eq!(http.headers.get("Authorization"), Some(&"Bearer test-token".to_string()));
         } else {
             panic!("Expected HTTP server config");
         }
@@ -241,7 +232,6 @@ mod tests {
         if let Some(http) = config.mcp_servers["minimal-http"].as_http() {
             assert_eq!(http.url, "http://localhost:8080");
             assert!(http.authorization_token.is_empty());
-            assert!(http.headers.is_empty());
         } else {
             panic!("Expected HTTP server config");
         }

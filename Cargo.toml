@@ -35,6 +35,7 @@ axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = "0.7"
+sse-stream = "0.2.1"
 
 [dev-dependencies]
 tempfile = "3.8"

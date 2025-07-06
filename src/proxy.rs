@@ -21,16 +21,22 @@
 use crate::config::{HttpConfig, McpConfig, ServerConfig, StdioConfig};
 use crate::error::{ProxyError, Result};
 use futures::future;
+use futures::stream::BoxStream;
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer, ServiceExt},
-    transport::streamable_http_client::StreamableHttpClientTransport,
+    transport::streamable_http_client::{
+        StreamableHttpClient, StreamableHttpClientTransport,
+        StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
+    },
     Error as McpError, ServerHandler,
 };
+use sse_stream::{Error as SseError, Sse};
 use std::{collections::HashMap, sync::Arc};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use reqwest;
 
 /// The main proxy server that aggregates multiple MCP servers
 #[derive(Clone)]
@@ -57,6 +63,59 @@ pub struct ConnectedServer {
     pub resources: Vec<Resource>,
     /// Client connection to this server
     pub client: Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+}
+
+/// A wrapper for a StreamableHttpClient that adds a Bearer token to every request.
+#[derive(Clone)]
+struct BearerAuthClient<C> {
+    inner: C,
+    token: String,
+}
+
+impl<C> BearerAuthClient<C> {
+    fn new(inner: C, token: String) -> Self {
+        Self { inner, token }
+    }
+}
+
+impl<C> StreamableHttpClient for BearerAuthClient<C>
+where
+    C: StreamableHttpClient + Send + Sync,
+    C::Error: 'static,
+{
+    type Error = C::Error;
+
+    fn get_stream<'a>(
+        &'a self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        _auth_token: Option<String>,
+    ) -> impl std::future::Future<Output = std::result::Result<BoxStream<'static, std::result::Result<Sse, SseError>>, StreamableHttpError<Self::Error>>> + Send + 'a {
+        self.inner
+            .get_stream(uri, session_id, last_event_id, Some(self.token.clone()))
+    }
+
+    fn post_message<'a>(
+        &'a self,
+        uri: Arc<str>,
+        message: JsonRpcMessage<ClientRequest, ClientResult, ClientNotification>,
+        session_id: Option<Arc<str>>,
+        _auth_token: Option<String>,
+    ) -> impl std::future::Future<Output = std::result::Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>>> + Send + 'a {
+        self.inner
+            .post_message(uri, message, session_id, Some(self.token.clone()))
+    }
+
+    fn delete_session<'a>(
+        &'a self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        _auth_token: Option<String>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), StreamableHttpError<Self::Error>>> + Send + 'a {
+        self.inner
+            .delete_session(uri, session_id, Some(self.token.clone()))
+    }
 }
 
 impl ProxyServer {
@@ -405,32 +464,27 @@ impl ProxyServer {
         tracing::debug!("Creating HTTP transport for server: {}", server_name);
 
         let uri: Arc<str> = Arc::from(config.url.as_str());
-        let transport = StreamableHttpClientTransport::from_uri(uri);
-        
-        // Configure authorization if provided
+        let http_client = reqwest::Client::new();
+        let transport_config = StreamableHttpClientTransportConfig::with_uri(uri);
+
+        // If an auth token is provided, wrap the standard client with our BearerAuthClient.
+        // Otherwise, use the standard client directly.
         if !config.authorization_token.is_empty() {
-            tracing::debug!("Configuring authorization for server: {}", server_name);
-            // TODO: Once rmcp supports it, set authorization header here
-            // transport.set_authorization(&config.authorization_token);
+            tracing::debug!("Bearer authentication enabled for server: {}", server_name);
+            let auth_client = BearerAuthClient::new(http_client, config.authorization_token);
+            let transport = StreamableHttpClientTransport::with_client(
+                auth_client,
+                transport_config,
+            );
+            handler.serve(transport).await
+        } else {
+            let transport = StreamableHttpClientTransport::with_client(
+                http_client,
+                transport_config,
+            );
+            handler.serve(transport).await
         }
-        
-        // Configure additional headers if provided  
-        if !config.headers.is_empty() {
-            tracing::debug!("Configuring {} custom headers for server: {}", config.headers.len(), server_name);
-            // TODO: Once rmcp supports it, set custom headers here
-            // for (key, value) in &config.headers {
-            //     transport.add_header(key, value);
-            // }
-        }
-
-        tracing::debug!("Serving client for server: {}", server_name);
-        let client = handler
-            .serve(transport)
-            .await
-            .map_err(|e| ProxyError::connection(server_name, format!("Failed to serve HTTP client: {}", e)))?;
-
-        tracing::info!("Successfully connected to HTTP server: {}", server_name);
-        Ok(client)
+        .map_err(|e| ProxyError::connection(server_name, format!("Failed to serve HTTP client: {}", e)))
     }
 
     /// Get all tools from all connected servers
