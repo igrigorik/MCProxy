@@ -12,6 +12,15 @@ pub struct McpConfig {
     pub http_server: Option<HttpServerConfig>,
 }
 
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            mcp_servers: HashMap::new(),
+            http_server: Some(HttpServerConfig::default()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ServerConfig {

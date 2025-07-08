@@ -20,6 +20,7 @@
 
 use crate::config::{HttpConfig, McpConfig, ServerConfig, StdioConfig};
 use crate::error::{ProxyError, Result};
+use crate::middleware::{client::MiddlewareAppliedClient, MiddlewareManager};
 use futures::future;
 use futures::stream::BoxStream;
 use rmcp::{
@@ -47,6 +48,8 @@ pub struct ProxyServer {
     config: Arc<McpConfig>,
     /// Process handles for stdio servers that need cleanup
     process_handles: Arc<RwLock<HashMap<String, Child>>>,
+    /// The middleware manager
+    middleware: Arc<MiddlewareManager>,
 }
 
 /// Represents a connected MCP server
@@ -62,7 +65,7 @@ pub struct ConnectedServer {
     /// Available resources from this server
     pub resources: Vec<Resource>,
     /// Client connection to this server
-    pub client: Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>,
+    pub client: Arc<MiddlewareAppliedClient>,
 }
 
 /// A wrapper for a StreamableHttpClient that adds a Bearer token to every request.
@@ -139,10 +142,12 @@ impl ProxyServer {
     pub async fn new(config: McpConfig) -> Result<Self> {
         let servers = Arc::new(RwLock::new(HashMap::new()));
         let process_handles = Arc::new(RwLock::new(HashMap::new()));
+        let middleware = Arc::new(MiddlewareManager::from_config(&config));
         let proxy = ProxyServer {
             servers: servers.clone(),
             config: Arc::new(config.clone()),
             process_handles,
+            middleware,
         };
 
         // Connect to all configured servers
@@ -223,12 +228,14 @@ impl ProxyServer {
                 let server_config = server_config.clone();
                 let servers = self.servers.clone();
                 let process_handles = self.process_handles.clone();
+                let middleware = self.middleware.clone();
 
                 async move {
                     match Self::connect_to_server_impl(
                         name.clone(),
                         server_config,
                         process_handles,
+                        middleware,
                     )
                     .await
                     {
@@ -288,66 +295,57 @@ impl ProxyServer {
     async fn populate_server_capabilities(server: &mut ConnectedServer) {
         // Fetch all capabilities in parallel
         let (tools_result, prompts_result, resources_result) = tokio::join!(
-            server.client.list_tools(None),
-            server.client.list_prompts(None),
-            server.client.list_resources(None)
+            server.client.list_tools(),
+            server.client.list_prompts(),
+            server.client.list_resources()
         );
 
         // Process tools
-        match tools_result {
-            Ok(tools_result) => {
-                server.tools = tools_result.tools;
-                tracing::debug!(
-                    "Populated {} tools for server {}",
-                    server.tools.len(),
-                    server.name
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch tools from server {}: {}",
-                    server.name,
-                    e
-                );
-            }
+        if let Ok(tools) = tools_result {
+            server.tools = tools.tools;
+            tracing::debug!(
+                "Populated {} tools for server {}",
+                server.tools.len(),
+                server.name
+            );
+        } else if let Err(e) = tools_result {
+            tracing::warn!(
+                "Failed to fetch tools from server {}: {}",
+                server.name,
+                e
+            );
         }
 
         // Process prompts
-        match prompts_result {
-            Ok(prompts_result) => {
-                server.prompts = prompts_result.prompts;
-                tracing::debug!(
-                    "Populated {} prompts for server {}",
-                    server.prompts.len(),
-                    server.name
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch prompts from server {}: {}",
-                    server.name,
-                    e
-                );
-            }
+        if let Ok(prompts) = prompts_result {
+            server.prompts = prompts.prompts;
+            tracing::debug!(
+                "Populated {} prompts for server {}",
+                server.prompts.len(),
+                server.name
+            );
+        } else if let Err(e) = prompts_result {
+            tracing::warn!(
+                "Failed to fetch prompts from server {}: {}",
+                server.name,
+                e
+            );
         }
 
         // Process resources
-        match resources_result {
-            Ok(resources_result) => {
-                server.resources = resources_result.resources;
-                tracing::debug!(
-                    "Populated {} resources for server {}",
-                    server.resources.len(),
-                    server.name
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch resources from server {}: {}",
-                    server.name,
-                    e
-                );
-            }
+        if let Ok(resources) = resources_result {
+            server.resources = resources.resources;
+            tracing::debug!(
+                "Populated {} resources for server {}",
+                server.resources.len(),
+                server.name
+            );
+        } else if let Err(e) = resources_result {
+            tracing::warn!(
+                "Failed to fetch resources from server {}: {}",
+                server.name,
+                e
+            );
         }
     }
 
@@ -356,6 +354,7 @@ impl ProxyServer {
         name: String,
         config: ServerConfig,
         process_handles: Arc<RwLock<HashMap<String, Child>>>,
+        middleware: Arc<MiddlewareManager>,
     ) -> Result<(String, ConnectedServer)> {
         if let Some(stdio_config) = config.as_stdio() {
             tracing::info!("Connecting to stdio server: {}", name);
@@ -363,12 +362,17 @@ impl ProxyServer {
             Self::connect_stdio_server(&name, stdio_config, handler, process_handles)
                 .await
                 .map(|client| {
+                    let server_middleware = middleware.create_client_middleware_for_server(&name);
+                    let wrapped_client = Arc::new(MiddlewareAppliedClient::new(
+                        Arc::new(client),
+                        server_middleware,
+                    ));
                     let connected = ConnectedServer {
                         name: name.clone(),
                         tools: Vec::new(), // Will be populated after connection
                         prompts: Vec::new(),
                         resources: Vec::new(),
-                        client: Arc::new(client),
+                        client: wrapped_client,
                     };
                     (name, connected)
                 })
@@ -378,12 +382,17 @@ impl ProxyServer {
             Self::connect_http_server(&name, http_config, handler)
                 .await
                 .map(|client| {
+                    let server_middleware = middleware.create_client_middleware_for_server(&name);
+                    let wrapped_client = Arc::new(MiddlewareAppliedClient::new(
+                        Arc::new(client),
+                        server_middleware,
+                    ));
                     let connected = ConnectedServer {
                         name: name.clone(),
                         tools: Vec::new(), // Will be populated after connection
                         prompts: Vec::new(),
                         resources: Vec::new(),
-                        client: Arc::new(client),
+                        client: wrapped_client,
                     };
                     (name, connected)
                 })
@@ -493,18 +502,20 @@ impl ProxyServer {
         let servers = self.servers.read().await;
 
         for (server_name, server) in servers.iter() {
-            match server.client.list_tools(None).await {
-                Ok(tools_result) => {
-                    for mut tool in tools_result.tools {
-                        // Prefix tool names with server name to avoid conflicts
-                        tool.name = Self::prefix_with_server(server_name, &tool.name).into();
-                        all_tools.push(tool);
-                    }
+            if let Ok(tools_result) = server.client.list_tools().await {
+                for mut tool in tools_result.tools {
+                    // Prefix tool names with server name to avoid conflicts
+                    tool.name = Self::prefix_with_server(server_name, &tool.name).into();
+                    all_tools.push(tool);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to get tools from server {}: {}", server_name, e);
-                }
+            } else if let Err(e) = server.client.list_tools().await {
+                tracing::warn!("Failed to get tools from server {}: {}", server_name, e);
             }
+        }
+
+        // Apply proxy middleware
+        for mw in self.middleware.proxy.iter() {
+            mw.on_list_tools(&mut all_tools).await;
         }
 
         all_tools
@@ -516,18 +527,20 @@ impl ProxyServer {
         let servers = self.servers.read().await;
 
         for (server_name, server) in servers.iter() {
-            match server.client.list_prompts(None).await {
-                Ok(prompts_result) => {
-                    for mut prompt in prompts_result.prompts {
-                        // Prefix prompt names with server name for disambiguation
-                        prompt.name = Self::prefix_with_server(server_name, &prompt.name);
-                        all_prompts.push(prompt);
-                    }
+            if let Ok(prompts_result) = server.client.list_prompts().await {
+                for mut prompt in prompts_result.prompts {
+                    // Prefix prompt names with server name for disambiguation
+                    prompt.name = Self::prefix_with_server(server_name, &prompt.name);
+                    all_prompts.push(prompt);
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to list prompts from server '{}': {}", server_name, e);
-                }
+            } else if let Err(e) = server.client.list_prompts().await {
+                tracing::warn!("Failed to list prompts from server '{}': {}", server_name, e);
             }
+        }
+        
+        // Apply proxy middleware
+        for mw in self.middleware.proxy.iter() {
+            mw.on_list_prompts(&mut all_prompts).await;
         }
 
         all_prompts
@@ -539,22 +552,24 @@ impl ProxyServer {
         let servers = self.servers.read().await;
 
         for (server_name, server) in servers.iter() {
-            match server.client.list_resources(None).await {
-                Ok(resources_result) => {
-                    for mut resource in resources_result.resources {
-                        // Prefix resource URIs with server name for disambiguation
-                        resource.uri = Self::prefix_with_server(server_name, &resource.uri);
-                        all_resources.push(resource);
-                    }
+            if let Ok(resources_result) = server.client.list_resources().await {
+                for mut resource in resources_result.resources {
+                    // Prefix resource URIs with server name for disambiguation
+                    resource.uri = Self::prefix_with_server(server_name, &resource.uri);
+                    all_resources.push(resource);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to list resources from server '{}': {}",
-                        server_name,
-                        e
-                    );
-                }
+            } else if let Err(e) = server.client.list_resources().await {
+                tracing::warn!(
+                    "Failed to list resources from server '{}': {}",
+                    server_name,
+                    e
+                );
             }
+        }
+
+        // Apply proxy middleware
+        for mw in self.middleware.proxy.iter() {
+            mw.on_list_resources(&mut all_resources).await;
         }
 
         all_resources
@@ -595,7 +610,12 @@ impl ProxyServer {
             }
             Err(e) => {
                 tracing::error!("Tool call failed for '{}' on server '{}': {}", actual_tool_name, server_name, e);
-                Err(McpError::internal_error(format!("Failed to call tool on server {}: {}", server_name, e), None))
+                // Convert ServiceError to McpError for the final response
+                let mcp_error = match e {
+                    rmcp::service::ServiceError::McpError(err) => err,
+                    _ => McpError::internal_error(format!("Failed to call tool on server {}: {}", server_name, e), None),
+                };
+                Err(mcp_error)
             }
         }
     }

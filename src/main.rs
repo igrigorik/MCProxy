@@ -33,6 +33,7 @@ mod config;
 mod error;
 mod http_server;
 mod proxy;
+mod middleware;
 
 /// Apply environment variable overrides to the configuration
 fn apply_env_overrides(config: &mut config::McpConfig) {
