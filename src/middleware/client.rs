@@ -10,6 +10,7 @@ use rmcp::{
     RoleClient,
 };
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// A running service with client middleware applied.
 ///
@@ -42,9 +43,11 @@ impl MiddlewareAppliedClient {
 
     /// Lists tools from the downstream server, applying middleware.
     pub async fn list_tools(&self) -> Result<ListToolsResult, ServiceError> {
+        let request_id = Uuid::new_v4();
+        
         // Apply pre-call middleware
         for mw in &self.middleware {
-            mw.before_list_tools().await;
+            mw.before_list_tools(request_id).await;
         }
 
         // Make the actual call
@@ -52,7 +55,7 @@ impl MiddlewareAppliedClient {
 
         // Apply post-call middleware
         for mw in &self.middleware {
-            mw.after_list_tools(&result).await;
+            mw.after_list_tools(request_id, &result).await;
         }
 
         result
@@ -63,9 +66,11 @@ impl MiddlewareAppliedClient {
         &self,
         request: CallToolRequestParam,
     ) -> Result<CallToolResult, ServiceError> {
+        let request_id = Uuid::new_v4();
+        
         // Apply pre-call middleware
         for mw in &self.middleware {
-            mw.before_call_tool(&request).await;
+            mw.before_call_tool(request_id, &request).await;
         }
 
         // Make the actual call
@@ -73,7 +78,7 @@ impl MiddlewareAppliedClient {
 
         // Apply post-call middleware
         for mw in &self.middleware {
-            mw.after_call_tool(&result).await;
+            mw.after_call_tool(request_id, &result).await;
         }
 
         result
@@ -81,9 +86,11 @@ impl MiddlewareAppliedClient {
 
     /// Lists prompts from the downstream server, applying middleware.
     pub async fn list_prompts(&self) -> Result<ListPromptsResult, ServiceError> {
+        let request_id = Uuid::new_v4();
+        
         // Apply pre-call middleware
         for mw in &self.middleware {
-            mw.before_list_prompts().await;
+            mw.before_list_prompts(request_id).await;
         }
 
         // Make the actual call
@@ -91,7 +98,7 @@ impl MiddlewareAppliedClient {
 
         // Apply post-call middleware
         for mw in &self.middleware {
-            mw.after_list_prompts(&result).await;
+            mw.after_list_prompts(request_id, &result).await;
         }
 
         result
@@ -99,9 +106,11 @@ impl MiddlewareAppliedClient {
 
     /// Lists resources from the downstream server, applying middleware.
     pub async fn list_resources(&self) -> Result<ListResourcesResult, ServiceError> {
+        let request_id = Uuid::new_v4();
+        
         // Apply pre-call middleware
         for mw in &self.middleware {
-            mw.before_list_resources().await;
+            mw.before_list_resources(request_id).await;
         }
 
         // Make the actual call
@@ -109,7 +118,7 @@ impl MiddlewareAppliedClient {
 
         // Apply post-call middleware
         for mw in &self.middleware {
-            mw.after_list_resources(&result).await;
+            mw.after_list_resources(request_id, &result).await;
         }
 
         result
@@ -120,29 +129,32 @@ impl MiddlewareAppliedClient {
 ///
 /// This middleware is useful for tasks like observability, caching, or adding
 /// retry logic for individual downstream servers.
+/// 
+/// Each method receives a request_id UUID that uniquely identifies the request,
+/// allowing middleware to correlate before/after calls and maintain per-request state.
 #[async_trait]
 pub trait ClientMiddleware: Send + Sync {
     /// Called before `list_tools` is invoked on the downstream server.
-    async fn before_list_tools(&self) {}
+    async fn before_list_tools(&self, _request_id: Uuid) {}
 
     /// Called after `list_tools` completes (whether successful or failed).
-    async fn after_list_tools(&self, _result: &Result<ListToolsResult, ServiceError>) {}
+    async fn after_list_tools(&self, _request_id: Uuid, _result: &Result<ListToolsResult, ServiceError>) {}
 
     /// Called before `call_tool` is invoked on the downstream server.
-    async fn before_call_tool(&self, _request: &CallToolRequestParam) {}
+    async fn before_call_tool(&self, _request_id: Uuid, _request: &CallToolRequestParam) {}
 
     /// Called after `call_tool` completes (whether successful or failed).
-    async fn after_call_tool(&self, _result: &Result<CallToolResult, ServiceError>) {}
+    async fn after_call_tool(&self, _request_id: Uuid, _result: &Result<CallToolResult, ServiceError>) {}
 
     /// Called before `list_prompts` is invoked on the downstream server.
-    async fn before_list_prompts(&self) {}
+    async fn before_list_prompts(&self, _request_id: Uuid) {}
 
     /// Called after `list_prompts` completes (whether successful or failed).
-    async fn after_list_prompts(&self, _result: &Result<ListPromptsResult, ServiceError>) {}
+    async fn after_list_prompts(&self, _request_id: Uuid, _result: &Result<ListPromptsResult, ServiceError>) {}
 
     /// Called before `list_resources` is invoked on the downstream server.
-    async fn before_list_resources(&self) {}
+    async fn before_list_resources(&self, _request_id: Uuid) {}
 
     /// Called after `list_resources` completes (whether successful or failed).
-    async fn after_list_resources(&self, _result: &Result<ListResourcesResult, ServiceError>) {}
+    async fn after_list_resources(&self, _request_id: Uuid, _result: &Result<ListResourcesResult, ServiceError>) {}
 } 

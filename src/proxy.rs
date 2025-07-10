@@ -142,7 +142,7 @@ impl ProxyServer {
     pub async fn new(config: McpConfig) -> Result<Self> {
         let servers = Arc::new(RwLock::new(HashMap::new()));
         let process_handles = Arc::new(RwLock::new(HashMap::new()));
-        let middleware = Arc::new(MiddlewareManager::from_config(&config));
+        let middleware = Arc::new(MiddlewareManager::from_config(&config)?);
         let proxy = ProxyServer {
             servers: servers.clone(),
             config: Arc::new(config.clone()),
@@ -236,6 +236,7 @@ impl ProxyServer {
                         server_config,
                         process_handles,
                         middleware,
+                        &self.config,
                     )
                     .await
                     {
@@ -355,14 +356,15 @@ impl ProxyServer {
         config: ServerConfig,
         process_handles: Arc<RwLock<HashMap<String, Child>>>,
         middleware: Arc<MiddlewareManager>,
+        full_config: &McpConfig,
     ) -> Result<(String, ConnectedServer)> {
         if let Some(stdio_config) = config.as_stdio() {
             tracing::info!("Connecting to stdio server: {}", name);
             let handler = ();
             Self::connect_stdio_server(&name, stdio_config, handler, process_handles)
                 .await
-                .map(|client| {
-                    let server_middleware = middleware.create_client_middleware_for_server(&name);
+                .and_then(|client| {
+                    let server_middleware = middleware.create_client_middleware_for_server(&name, full_config)?;
                     let wrapped_client = Arc::new(MiddlewareAppliedClient::new(
                         Arc::new(client),
                         server_middleware,
@@ -374,15 +376,15 @@ impl ProxyServer {
                         resources: Vec::new(),
                         client: wrapped_client,
                     };
-                    (name, connected)
+                    Ok((name, connected))
                 })
         } else if let Some(http_config) = config.as_http() {
             tracing::info!("Connecting to HTTP server: {}", name);
             let handler = ();
             Self::connect_http_server(&name, http_config, handler)
                 .await
-                .map(|client| {
-                    let server_middleware = middleware.create_client_middleware_for_server(&name);
+                .and_then(|client| {
+                    let server_middleware = middleware.create_client_middleware_for_server(&name, full_config)?;
                     let wrapped_client = Arc::new(MiddlewareAppliedClient::new(
                         Arc::new(client),
                         server_middleware,
@@ -394,7 +396,7 @@ impl ProxyServer {
                         resources: Vec::new(),
                         client: wrapped_client,
                     };
-                    (name, connected)
+                    Ok((name, connected))
                 })
         } else {
             Err(ProxyError::config(format!(

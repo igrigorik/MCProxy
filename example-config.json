@@ -1,0 +1,71 @@
+{
+  "mcpServers": {
+    "file-server": {
+      "command": "npx",
+      "args": [
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ],
+      "env": {}
+    },
+    "web-server": {
+      "url": "http://localhost:3001",
+      "authorizationToken": ""
+    },
+    "critical-api": {
+      "url": "https://api.example.com/mcp",
+      "authorizationToken": "bearer-token-here"
+    }
+  },
+  "httpServer": {
+    "host": "localhost",
+    "port": 8080,
+    "corsEnabled": true,
+    "corsOrigins": [
+      "*"
+    ],
+    "shutdownTimeout": 5,
+    "middleware": {
+      "proxy": [
+        {
+          "type": "tool_filter",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "type": "description_enricher",
+          "enabled": true,
+          "config": {}
+        }
+      ],
+      "client": {
+        "default": [
+          {
+            "type": "logging",
+            "enabled": true,
+            "config": {
+              "level": "info"
+            }
+          }
+        ],
+        "servers": {
+          "critical-api": [
+            {
+              "type": "logging",
+              "enabled": true,
+              "config": {
+                "level": "debug"
+              }
+            }
+          ],
+          "file-server": [
+            {
+              "type": "logging",
+              "enabled": false
+            }
+          ]
+        }
+      }
+    }
+  }
+}

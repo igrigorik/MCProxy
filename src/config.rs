@@ -12,6 +12,50 @@ pub struct McpConfig {
     pub http_server: Option<HttpServerConfig>,
 }
 
+/// Configuration for middleware system
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct MiddlewareConfig {
+    /// Global proxy middleware that operates on aggregated results
+    #[serde(default)]
+    pub proxy: Vec<MiddlewareSpec>,
+    
+    /// Client middleware configuration
+    #[serde(default)]
+    pub client: ClientMiddlewareConfig,
+}
+
+/// Configuration for client middleware with server-specific overrides
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct ClientMiddlewareConfig {
+    /// Default client middleware applied to all servers
+    #[serde(default)]
+    pub default: Vec<MiddlewareSpec>,
+    
+    /// Server-specific middleware overrides
+    #[serde(default)]
+    pub servers: HashMap<String, Vec<MiddlewareSpec>>,
+}
+
+/// Specification for a single middleware instance
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MiddlewareSpec {
+    /// Type/name of the middleware
+    #[serde(rename = "type")]
+    pub middleware_type: String,
+    
+    /// Whether this middleware is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    
+    /// Middleware-specific configuration
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
@@ -66,6 +110,10 @@ pub struct HttpServerConfig {
     /// Timeout in seconds for graceful shutdown (default: 5)
     #[serde(default = "default_shutdown_timeout", rename = "shutdownTimeout")]
     pub shutdown_timeout: u64,
+    
+    /// Middleware configuration for request/response processing
+    #[serde(default)]
+    pub middleware: MiddlewareConfig,
 }
 
 fn default_host() -> String {
@@ -96,6 +144,7 @@ impl Default for HttpServerConfig {
             cors_enabled: default_cors_enabled(),
             cors_origins: default_cors_origins(),
             shutdown_timeout: default_shutdown_timeout(),
+            middleware: MiddlewareConfig::default(),
         }
     }
 }
@@ -206,9 +255,113 @@ mod tests {
         }
 
         // Test HTTP server configuration
-        let http_server_config = config.http_server.expect("HTTP server config should be present");
+        let http_server_config = config.http_server.as_ref().expect("HTTP server config should be present");
         assert_eq!(http_server_config.host, "0.0.0.0");
         assert_eq!(http_server_config.port, 9000);
+        
+        // Middleware should be default (empty)
+        let middleware = &http_server_config.middleware;
+        assert!(middleware.proxy.is_empty());
+        assert!(middleware.client.default.is_empty());
+        assert!(middleware.client.servers.is_empty());
+    }
+
+    #[test]
+    fn test_middleware_config_parsing() {
+        let json_data = r#"
+        {
+          "mcpServers": {
+            "test-server": {
+              "command": "test-command"
+            }
+          },
+          "httpServer": {
+            "middleware": {
+              "proxy": [
+                {
+                  "type": "tool_filter",
+                  "enabled": true
+                },
+                {
+                  "type": "description_enricher",
+                  "enabled": false
+                }
+              ],
+              "client": {
+                "default": [
+                  {
+                    "type": "logging",
+                    "config": {
+                      "level": "info"
+                    }
+                  }
+                ],
+                "servers": {
+                  "critical-server": [
+                    {
+                      "type": "logging",
+                      "config": {
+                        "level": "debug"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        "#;
+
+        let config: McpConfig = serde_json::from_str(json_data).expect("Failed to parse config");
+        let middleware = &config.http_server.as_ref().unwrap().middleware;
+        
+        // Test proxy middleware
+        assert_eq!(middleware.proxy.len(), 2);
+        assert_eq!(middleware.proxy[0].middleware_type, "tool_filter");
+        assert!(middleware.proxy[0].enabled);
+        assert_eq!(middleware.proxy[1].middleware_type, "description_enricher");
+        assert!(!middleware.proxy[1].enabled);
+        
+        // Test default client middleware
+        assert_eq!(middleware.client.default.len(), 1);
+        assert_eq!(middleware.client.default[0].middleware_type, "logging");
+        assert!(middleware.client.default[0].enabled);
+        assert_eq!(middleware.client.default[0].config["level"], "info");
+        
+        // Test server-specific client middleware
+        assert_eq!(middleware.client.servers.len(), 1);
+        let critical_middleware = &middleware.client.servers["critical-server"];
+        assert_eq!(critical_middleware.len(), 1);
+        assert_eq!(critical_middleware[0].middleware_type, "logging");
+        assert_eq!(critical_middleware[0].config["level"], "debug");
+    }
+
+    #[test]
+    fn test_middleware_spec_defaults() {
+        let json_data = r#"
+        {
+          "mcpServers": {},
+          "httpServer": {
+            "middleware": {
+              "proxy": [
+                {
+                  "type": "tool_filter"
+                }
+              ]
+            }
+          }
+        }
+        "#;
+
+        let config: McpConfig = serde_json::from_str(json_data).expect("Failed to parse config");
+        let middleware = &config.http_server.as_ref().unwrap().middleware;
+        
+        // Test defaults
+        assert_eq!(middleware.proxy.len(), 1);
+        let spec = &middleware.proxy[0];
+        assert_eq!(spec.middleware_type, "tool_filter");
+        assert!(spec.enabled); // Should default to true
+        assert!(spec.config.is_null()); // Should default to null
     }
 
     #[test]
@@ -266,7 +419,7 @@ mod tests {
         assert!(config.mcp_servers.contains_key("test-server"));
         
         // HTTP server config should be added with defaults
-        let http_config = config.http_server.expect("HTTP server config should be present");
+        let http_config = config.http_server.as_ref().expect("HTTP server config should be present");
         assert_eq!(http_config.host, "localhost");
         assert_eq!(http_config.port, 8080);
 

@@ -5,6 +5,17 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
 - **Tool aggregation**: Connects to multiple upstream MCP servers (via `stdio` or `http`) and exposes an aggregated list of all their tools.
 - **Dynamic tool updates**: Listens for `toolListChanged` notifications from upstream servers and dynamically updates its aggregated tool list.
 
+## Middleware System (TL;DR)
+
+The proxy includes a flexible middleware system for intercepting and modifying requests/responses:
+
+- **ClientMiddleware**: Operates on individual server calls (logging, payload inspection for security, etc)
+- **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (filtering, enrichment, etc)
+- **Built-in middleware**: Logging, tool filtering, description enrichment
+- **JSON configuration**: Server-specific overrides and flexible configuration options
+
+For detailed middleware documentation, see [MIDDLEWARE.md](MIDDLEWARE.md).
+
 ## Configuration
 
 The proxy is configured using a JSON file passed as a command-line argument. The file should contain a single object with an `mcpServers` key — i.e. same file you already use to configure VSCode/Cursor/Claude/etc. 

@@ -278,6 +278,7 @@ mod tests {
                     cors_enabled: self.cors_enabled.unwrap_or(true),
                     cors_origins: self.cors_origins.unwrap_or_else(|| vec!["*".to_string()]),
                     shutdown_timeout: self.shutdown_timeout.unwrap_or(5),
+                    middleware: config::MiddlewareConfig::default(),
                 }),
             };
             TestFixture { config }
@@ -298,6 +299,7 @@ mod tests {
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
             shutdown_timeout: 5,
+            middleware: config::MiddlewareConfig::default(),
         };
         http_server::create_router(shared_proxy, &test_config)
     }
