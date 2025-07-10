@@ -9,11 +9,11 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
 
 The proxy includes a flexible middleware system for intercepting and modifying requests/responses:
 
-- **ClientMiddleware**: Operates on individual server calls (logging, payload inspection for security, etc)
-- **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (filtering, enrichment, etc)
+- **ClientMiddleware**: Operates on individual server calls (logging, tool filtering, payload inspection for security, etc)
+- **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (description enrichment, etc)
 - **Built-in middleware**: Logging, tool filtering, description enrichment
 - **JSON configuration**: Server-specific overrides and flexible configuration options
-
+  
 For detailed middleware documentation, see [MIDDLEWARE.md](MIDDLEWARE.md).
 
 ## Configuration

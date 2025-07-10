@@ -51,11 +51,18 @@ impl MiddlewareAppliedClient {
         }
 
         // Make the actual call
-        let result = self.inner.list_tools(None).await;
+        let mut result = self.inner.list_tools(None).await;
 
         // Apply post-call middleware
         for mw in &self.middleware {
             mw.after_list_tools(request_id, &result).await;
+        }
+
+        // Apply result modification middleware (only if successful)
+        if let Ok(ref mut tools_result) = result {
+            for mw in &self.middleware {
+                mw.modify_list_tools_result(request_id, tools_result).await;
+            }
         }
 
         result
@@ -94,11 +101,18 @@ impl MiddlewareAppliedClient {
         }
 
         // Make the actual call
-        let result = self.inner.list_prompts(None).await;
+        let mut result = self.inner.list_prompts(None).await;
 
         // Apply post-call middleware
         for mw in &self.middleware {
             mw.after_list_prompts(request_id, &result).await;
+        }
+
+        // Apply result modification middleware (only if successful)
+        if let Ok(ref mut prompts_result) = result {
+            for mw in &self.middleware {
+                mw.modify_list_prompts_result(request_id, prompts_result).await;
+            }
         }
 
         result
@@ -114,11 +128,18 @@ impl MiddlewareAppliedClient {
         }
 
         // Make the actual call
-        let result = self.inner.list_resources(None).await;
+        let mut result = self.inner.list_resources(None).await;
 
         // Apply post-call middleware
         for mw in &self.middleware {
             mw.after_list_resources(request_id, &result).await;
+        }
+
+        // Apply result modification middleware (only if successful)
+        if let Ok(ref mut resources_result) = result {
+            for mw in &self.middleware {
+                mw.modify_list_resources_result(request_id, resources_result).await;
+            }
         }
 
         result
@@ -140,6 +161,10 @@ pub trait ClientMiddleware: Send + Sync {
     /// Called after `list_tools` completes (whether successful or failed).
     async fn after_list_tools(&self, _request_id: Uuid, _result: &Result<ListToolsResult, ServiceError>) {}
 
+    /// Called to modify the successful result of `list_tools`.
+    /// This is called after `after_list_tools` and only if the result was successful.
+    async fn modify_list_tools_result(&self, _request_id: Uuid, _result: &mut ListToolsResult) {}
+
     /// Called before `call_tool` is invoked on the downstream server.
     async fn before_call_tool(&self, _request_id: Uuid, _request: &CallToolRequestParam) {}
 
@@ -152,9 +177,17 @@ pub trait ClientMiddleware: Send + Sync {
     /// Called after `list_prompts` completes (whether successful or failed).
     async fn after_list_prompts(&self, _request_id: Uuid, _result: &Result<ListPromptsResult, ServiceError>) {}
 
+    /// Called to modify the successful result of `list_prompts`.
+    /// This is called after `after_list_prompts` and only if the result was successful.
+    async fn modify_list_prompts_result(&self, _request_id: Uuid, _result: &mut ListPromptsResult) {}
+
     /// Called before `list_resources` is invoked on the downstream server.
     async fn before_list_resources(&self, _request_id: Uuid) {}
 
     /// Called after `list_resources` completes (whether successful or failed).
     async fn after_list_resources(&self, _request_id: Uuid, _result: &Result<ListResourcesResult, ServiceError>) {}
+
+    /// Called to modify the successful result of `list_resources`.
+    /// This is called after `after_list_resources` and only if the result was successful.
+    async fn modify_list_resources_result(&self, _request_id: Uuid, _result: &mut ListResourcesResult) {}
 } 

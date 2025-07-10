@@ -28,11 +28,6 @@
     "middleware": {
       "proxy": [
         {
-          "type": "tool_filter",
-          "enabled": true,
-          "config": {}
-        },
-        {
           "type": "description_enricher",
           "enabled": true,
           "config": {}
@@ -62,6 +57,22 @@
             {
               "type": "logging",
               "enabled": false
+            },
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "disallow": "test|debug|dev"
+              }
+            }
+          ],
+          "web-server": [
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "allow": "search_|get_"
+              }
             }
           ]
         }

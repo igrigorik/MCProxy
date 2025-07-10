@@ -1,7 +1,5 @@
 //! Proxy middleware implementations that operate on aggregated results.
 
 pub mod description_enricher;
-pub mod tool_filter;
 
-pub use description_enricher::DescriptionEnricherFactory;
-pub use tool_filter::ToolFilterFactory; 
+pub use description_enricher::DescriptionEnricherFactory; 

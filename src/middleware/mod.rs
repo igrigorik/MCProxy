@@ -155,16 +155,11 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn test_proxy_middleware_filtering() {
+    async fn test_proxy_middleware_description_enrichment() {
         let mut config = McpConfig::default();
         if let Some(ref mut http_server) = config.http_server {
             http_server.middleware = MiddlewareConfig {
                 proxy: vec![
-                    MiddlewareSpec {
-                        middleware_type: "tool_filter".to_string(),
-                        enabled: true,
-                        config: serde_json::Value::Null,
-                    },
                     MiddlewareSpec {
                         middleware_type: "description_enricher".to_string(),
                         enabled: true,
@@ -176,17 +171,11 @@ mod tests {
         }
         let manager = MiddlewareManager::from_config(&config).unwrap();
         
-        // Create test tools including some with "test" in the name
+        // Create test tools
         let mut tools = vec![
             Tool {
                 name: "production_tool".into(),
                 description: Some("A production tool".into()),
-                input_schema: Arc::new(serde_json::Map::new()),
-                annotations: None,
-            },
-            Tool {
-                name: "test_helper".into(),
-                description: Some("A test helper".into()),
                 input_schema: Arc::new(serde_json::Map::new()),
                 annotations: None,
             },
@@ -203,16 +192,14 @@ mod tests {
             mw.on_list_tools(&mut tools).await;
         }
         
-        // Verify test tool was filtered out
-        assert_eq!(tools.len(), 2);
-        assert!(!tools.iter().any(|t| t.name.contains("test")));
-        
         // Verify descriptions were enriched
         for tool in &tools {
             if let Some(ref desc) = tool.description {
                 assert!(desc.contains("(via mcproxy)"));
             }
         }
+        
+        assert_eq!(tools.len(), 2);
     }
 
     #[test]
@@ -235,11 +222,6 @@ mod tests {
             http_server.middleware = MiddlewareConfig {
                 proxy: vec![
                     MiddlewareSpec {
-                        middleware_type: "tool_filter".to_string(),
-                        enabled: true,
-                        config: serde_json::Value::Null,
-                    },
-                    MiddlewareSpec {
                         middleware_type: "description_enricher".to_string(),
                         enabled: true,
                         config: serde_json::Value::Null,
@@ -250,7 +232,7 @@ mod tests {
         }
         
         let manager = MiddlewareManager::from_config(&config).unwrap();
-        assert_eq!(manager.proxy.len(), 2);
+        assert_eq!(manager.proxy.len(), 1);
     }
     
     #[test]
@@ -275,6 +257,39 @@ mod tests {
         let manager = MiddlewareManager::from_config(&config).unwrap();
         let client_middleware = manager.create_client_middleware_for_server("any_server", &config).unwrap();
         assert_eq!(client_middleware.len(), 1);
+    }
+
+    #[test]
+    fn test_client_middleware_tool_filter() {
+        let mut config = McpConfig::default();
+        let mut servers = HashMap::new();
+        servers.insert("github".to_string(), vec![
+            MiddlewareSpec {
+                middleware_type: "tool_filter".to_string(),
+                enabled: true,
+                config: serde_json::json!({
+                    "allow": "issue"
+                }),
+            },
+        ]);
+        
+        if let Some(ref mut http_server) = config.http_server {
+            http_server.middleware = MiddlewareConfig {
+                proxy: vec![],
+                client: ClientMiddlewareConfig {
+                    default: vec![],
+                    servers,
+                },
+            };
+        }
+        
+        let manager = MiddlewareManager::from_config(&config).unwrap();
+        let client_middleware = manager.create_client_middleware_for_server("github", &config).unwrap();
+        assert_eq!(client_middleware.len(), 1);
+        
+        // Test that other servers don't get the tool filter
+        let other_middleware = manager.create_client_middleware_for_server("other", &config).unwrap();
+        assert_eq!(other_middleware.len(), 0);
     }
     
     #[test]
@@ -323,7 +338,7 @@ mod tests {
             http_server.middleware = MiddlewareConfig {
                 proxy: vec![
                     MiddlewareSpec {
-                        middleware_type: "tool_filter".to_string(),
+                        middleware_type: "description_enricher".to_string(),
                         enabled: true,
                         config: serde_json::Value::Null,
                     },

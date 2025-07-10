@@ -80,11 +80,43 @@ let middleware = LoggingClientMiddleware::new("my-server".to_string());
 ✅ [my-server] Tool call successful
 ```
 
-### TestToolFilterMiddleware
-Filters out tools containing "test" in their name:
+### ToolFilterClientMiddleware
+Filters tools from individual servers based on configurable regex patterns:
 
 ```rust
-let middleware = ToolFilterMiddleware;
+let config = ToolFilterConfig {
+    disallow: Some("test|debug".to_string()),
+    allow: None,
+};
+let middleware = ToolFilterClientMiddleware::new("server-name".to_string(), config)?;
+```
+
+**Configuration options:**
+- `disallow`: Regex pattern for tools to filter out
+- `allow`: Regex pattern for tools to keep (takes precedence over disallow)
+
+**Examples:**
+- `{"disallow": "test"}` - filters out tools containing "test"
+- `{"allow": "file_|search_"}` - only keeps tools starting with "file_" or "search_"
+- `{"disallow": "test|debug|dev"}` - filters out tools containing "test", "debug", or "dev"
+- `{}` - uses default behavior (allows everything)
+
+**Server-specific filtering:**
+```json
+"servers": {
+  "github": [
+    {
+      "type": "tool_filter",
+      "config": { "allow": "issue" }
+    }
+  ],
+  "filesystem": [
+    {
+      "type": "tool_filter",
+      "config": { "disallow": "test|tmp" }
+    }
+  ]
+}
 ```
 
 ### DescriptionEnricherMiddleware
@@ -132,7 +164,7 @@ Middleware are configured through the configuration file using a flexible JSON-b
     "middleware": {
       "proxy": [
         {
-          "type": "tool_filter",
+          "type": "description_enricher",
           "enabled": true,
           "config": {}
         }
@@ -156,6 +188,15 @@ Middleware are configured through the configuration file using a flexible JSON-b
                 "level": "debug"
               }
             }
+          ],
+          "github-server": [
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "allow": "issue"
+              }
+            }
           ]
         }
       }
@@ -167,11 +208,11 @@ Middleware are configured through the configuration file using a flexible JSON-b
 ### Built-in Middleware Types
 
 #### Proxy Middleware
-- **`tool_filter`**: Filters out tools with "test" in their name
 - **`description_enricher`**: Adds "(via mcproxy)" to tool/prompt/resource descriptions
 
 #### Client Middleware  
 - **`logging`**: Logs all operations with timing information per server
+- **`tool_filter`**: Filters tools based on configurable regex patterns (allow/disallow)
 
 ### Configuration Options
 
@@ -187,3 +228,42 @@ Client middleware can be configured per-server:
 - **`servers`**: Server-specific overrides by server name
 
 When a server has specific configuration, it completely replaces the default configuration for that server (no merging).
+
+### Advanced Tool Filter Configuration Examples
+
+The `tool_filter` middleware supports flexible regex-based filtering:
+
+```json
+{
+  "type": "tool_filter",
+  "enabled": true,
+  "config": {
+    "allow": "^(file_|search_|git_)"
+  }
+}
+```
+*Only allows tools starting with "file_", "search_", or "git_"*
+
+```json
+{
+  "type": "tool_filter", 
+  "enabled": true,
+  "config": {
+    "disallow": "test|debug|dev|tmp"
+  }
+}
+```
+*Filters out tools containing "test", "debug", "dev", or "tmp"*
+
+```json
+{
+  "type": "tool_filter",
+  "enabled": true,
+  "config": {
+    "allow": "^(?!.*test).*$"
+  }
+}
+```
+*Allows all tools except those containing "test" (using negative lookahead)*
+
+**Priority**: If both `allow` and `disallow` are specified, `allow` takes precedence.

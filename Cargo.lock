@@ -931,6 +931,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "libc",
+ "regex",
  "reqwest",
  "rmcp",
  "serde",

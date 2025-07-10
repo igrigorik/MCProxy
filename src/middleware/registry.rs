@@ -59,15 +59,15 @@ impl MiddlewareRegistry {
     
     /// Register all built-in middleware factories
     fn register_builtin_middleware(&mut self) {
-        use super::proxy_middleware::{ToolFilterFactory, DescriptionEnricherFactory};
-        use super::client_middleware::LoggingClientFactory;
+        use super::proxy_middleware::DescriptionEnricherFactory;
+        use super::client_middleware::{LoggingClientFactory, ToolFilterClientFactory};
         
         // Register proxy middleware
-        self.register_proxy_factory(Arc::new(ToolFilterFactory));
         self.register_proxy_factory(Arc::new(DescriptionEnricherFactory));
         
         // Register client middleware
         self.register_client_factory(Arc::new(LoggingClientFactory));
+        self.register_client_factory(Arc::new(ToolFilterClientFactory));
     }
 }
 
@@ -86,8 +86,9 @@ mod tests {
         let registry = MiddlewareRegistry::new();
         
         // Should have built-in middleware registered
-        assert!(registry.get_proxy_factory("tool_filter").is_some());
+        assert!(registry.get_proxy_factory("description_enricher").is_some());
         assert!(registry.get_client_factory("logging").is_some());
+        assert!(registry.get_client_factory("tool_filter").is_some());
     }
     
     #[test]
@@ -95,9 +96,9 @@ mod tests {
         let registry = MiddlewareRegistry::new();
         
         // Should be able to find built-in middleware
-        assert!(registry.get_proxy_factory("tool_filter").is_some());
         assert!(registry.get_proxy_factory("description_enricher").is_some());
         assert!(registry.get_client_factory("logging").is_some());
+        assert!(registry.get_client_factory("tool_filter").is_some());
         
         // Should return None for unknown types
         assert!(registry.get_proxy_factory("unknown").is_none());
