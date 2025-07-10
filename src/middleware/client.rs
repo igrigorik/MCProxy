@@ -7,10 +7,20 @@ use rmcp::{
         ListToolsResult,
     },
     service::ServiceError,
+    Error as McpError,
     RoleClient,
 };
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Result type for middleware checks
+#[derive(Debug, Clone)]
+pub enum MiddlewareResult {
+    /// The operation should proceed normally
+    Continue,
+    /// The operation should be blocked with the given error message
+    Block(String),
+}
 
 /// A running service with client middleware applied.
 ///
@@ -75,12 +85,35 @@ impl MiddlewareAppliedClient {
     ) -> Result<CallToolResult, ServiceError> {
         let request_id = Uuid::new_v4();
         
-        // Apply pre-call middleware
+        // Apply pre-call middleware - any middleware can block the call
         for mw in &self.middleware {
-            mw.before_call_tool(request_id, &request).await;
+            match mw.before_call_tool(request_id, &request).await {
+                MiddlewareResult::Block(message) => {
+                    tracing::warn!("🚫 Tool call blocked: {}", message);
+                    
+                    // Create a proper ServiceError for blocked calls
+                    let blocked_error = ServiceError::McpError(
+                        McpError::invalid_params(message.clone(), None)
+                    );
+                    
+                    // Apply post-call middleware with the blocked error result
+                    let blocked_service_result: Result<CallToolResult, ServiceError> = Err(ServiceError::McpError(
+                        McpError::invalid_params(message, None)
+                    ));
+                    for mw in &self.middleware {
+                        mw.after_call_tool(request_id, &blocked_service_result).await;
+                    }
+                    
+                    return Err(blocked_error);
+                }
+                MiddlewareResult::Continue => {
+                    // Continue to next middleware
+                    continue;
+                }
+            }
         }
 
-        // Make the actual call
+        // Make the actual call (only if not blocked)
         let result = self.inner.call_tool(request).await;
 
         // Apply post-call middleware
@@ -166,7 +199,10 @@ pub trait ClientMiddleware: Send + Sync {
     async fn modify_list_tools_result(&self, _request_id: Uuid, _result: &mut ListToolsResult) {}
 
     /// Called before `call_tool` is invoked on the downstream server.
-    async fn before_call_tool(&self, _request_id: Uuid, _request: &CallToolRequestParam) {}
+    /// Returns MiddlewareResult::Block(message) to block the call.
+    async fn before_call_tool(&self, _request_id: Uuid, _request: &CallToolRequestParam) -> MiddlewareResult {
+        MiddlewareResult::Continue
+    }
 
     /// Called after `call_tool` completes (whether successful or failed).
     async fn after_call_tool(&self, _request_id: Uuid, _result: &Result<CallToolResult, ServiceError>) {}

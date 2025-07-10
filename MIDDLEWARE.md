@@ -52,7 +52,10 @@ pub trait ClientMiddleware: Send + Sync {
     async fn before_list_tools(&self) {}
     async fn after_list_tools(&self, result: &Result<ListToolsResult, ServiceError>) {}
     
-    async fn before_call_tool(&self, request: &CallToolRequestParam) {}
+    // before_call_tool can return MiddlewareResult::Block to prevent the call
+    async fn before_call_tool(&self, request: &CallToolRequestParam) -> MiddlewareResult {
+        MiddlewareResult::Continue
+    }
     async fn after_call_tool(&self, result: &Result<CallToolResult, ServiceError>) {}
     
     async fn before_list_prompts(&self) {}
@@ -62,6 +65,23 @@ pub trait ClientMiddleware: Send + Sync {
     async fn after_list_resources(&self, result: &Result<ListResourcesResult, ServiceError>) {}
 }
 ```
+
+### MiddlewareResult
+
+```rust
+pub enum MiddlewareResult {
+    /// The operation should proceed normally  
+    Continue,
+    /// The operation should be blocked with the given error message
+    Block(String),
+}
+```
+
+Any middleware can block tool calls by returning `MiddlewareResult::Block(message)` from `before_call_tool`. When a middleware blocks a call:
+1. Processing stops immediately (short-circuits remaining middleware)
+2. A blocked `CallToolResult` with `is_error: true` is returned
+3. The actual tool call to downstream servers is never made
+4. All middleware still receive the `after_call_tool` notification
 
 ## Middleware Examples
 
@@ -100,6 +120,104 @@ let middleware = ToolFilterClientMiddleware::new("server-name".to_string(), conf
 - `{"allow": "file_|search_"}` - only keeps tools starting with "file_" or "search_"
 - `{"disallow": "test|debug|dev"}` - filters out tools containing "test", "debug", or "dev"
 - `{}` - uses default behavior (allows everything)
+
+### SecurityClientMiddleware
+Inspects tool call inputs and blocks calls that match security rules:
+
+```rust
+let config = SecurityConfig {
+    rules: vec![
+        SecurityRule {
+            name: "no_system_commands".to_string(),
+            description: "Block dangerous system commands".to_string(),
+            pattern: r"(?i)(rm\s+-rf|sudo\s+|passwd\s+)".to_string(),
+            block_message: "System commands are not allowed".to_string(),
+            enabled: true,
+        }
+    ],
+    log_blocked: true,
+};
+let middleware = SecurityClientMiddleware::new("server-name".to_string(), config)?;
+```
+
+**Configuration options:**
+- `rules`: Array of security rules to apply
+- `log_blocked`: Whether to log blocked calls (default: true)
+
+**Security Rule fields:**
+- `name`: Unique name for the rule
+- `description`: Human-readable description
+- `pattern`: Regex pattern to match against tool call content
+- `block_message`: Error message returned when rule is violated
+- `enabled`: Whether the rule is active (default: true)
+
+**Default security rules:**
+- **no_system_commands**: Blocks `rm -rf`, `sudo`, `passwd`, `shutdown`, `reboot`, `format`, etc.
+- **no_sensitive_files**: Blocks access to `/etc/passwd`, `/etc/shadow`, `.ssh/`, `.aws/`, `.env`, `config.json`, `secrets`
+- **no_network_commands**: Blocks `curl`, `wget`, `nc`, `netcat`, `telnet`, `ssh`, `ftp`, `sftp`
+
+**How it works:**
+1. Extracts searchable content from tool calls (tool name + JSON-serialized arguments)
+2. Checks content against each enabled security rule's regex pattern
+3. Returns blocked result with error message if any rule matches
+4. Logs blocked calls for security monitoring
+
+**Basic security configuration:**
+```json
+{
+  "middleware": {
+    "client": {
+      "default": [
+        {
+          "type": "security",
+          "enabled": true,
+          "config": {
+            "rules": [
+              {
+                "name": "no_system_commands",
+                "description": "Block dangerous system commands",
+                "pattern": "(?i)(rm\\s+-rf|sudo\\s+|passwd\\s+|shutdown|reboot)",
+                "block_message": "System commands are not allowed",
+                "enabled": true
+              }
+            ],
+            "log_blocked": true
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+**Server-specific security rules:**
+```json
+{
+  "middleware": {
+    "client": {
+      "servers": {
+        "fetch": [
+          {
+            "type": "security",
+            "enabled": true,
+            "config": {
+              "rules": [
+                {
+                  "name": "no_private_urls",
+                  "description": "Block private network URLs",
+                  "pattern": "(?i)(localhost|127\\.0\\.0\\.1|192\\.168\\.|file://)",
+                  "block_message": "Private network URLs are not allowed",
+                  "enabled": true
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
 
 **Server-specific filtering:**
 ```json

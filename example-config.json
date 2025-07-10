@@ -41,6 +41,43 @@
             "config": {
               "level": "info"
             }
+          },
+          {
+            "type": "security",
+            "enabled": true,
+            "config": {
+              "rules": [
+                {
+                  "name": "no_system_commands",
+                  "description": "Block dangerous system commands",
+                  "pattern": "(?i)(rm\\s+-rf|sudo\\s+|passwd\\s+|shutdown|reboot|format|del\\s+/|rd\\s+/s)",
+                  "block_message": "System commands are not allowed",
+                  "enabled": true
+                },
+                {
+                  "name": "no_sensitive_files",
+                  "description": "Block access to sensitive files",
+                  "pattern": "(?i)(/etc/passwd|/etc/shadow|\\.ssh/|\\.aws/|\\.env|config\\.json|secrets?)",
+                  "block_message": "Access to sensitive files is not allowed",
+                  "enabled": true
+                },
+                {
+                  "name": "no_network_commands",
+                  "description": "Block network commands",
+                  "pattern": "(?i)(curl|wget|nc|netcat|telnet|ssh|ftp|sftp)\\s+",
+                  "block_message": "Network commands are not allowed",
+                  "enabled": true
+                },
+                {
+                  "name": "no_secret_tokens",
+                  "description": "Block leaks of secret tokens",
+                  "pattern": "(?i)(github_pat)",
+                  "block_message": "Leaking secret tokens is not allowed",
+                  "enabled": true
+                }
+              ],
+              "log_blocked": true
+            }
           }
         ],
         "servers": {

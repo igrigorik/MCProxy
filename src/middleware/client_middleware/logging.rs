@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::middleware::client::ClientMiddleware;
+use crate::middleware::client::{ClientMiddleware, MiddlewareResult};
 use crate::middleware::ClientMiddlewareFactory;
 
 /// Request timing information with operation context
@@ -137,9 +137,10 @@ impl ClientMiddleware for LoggingClientMiddleware {
         }
     }
 
-    async fn before_call_tool(&self, request_id: Uuid, request: &CallToolRequestParam) {
+    async fn before_call_tool(&self, request_id: Uuid, request: &CallToolRequestParam) -> MiddlewareResult {
         info!("🔧 [{}] Calling tool: {} ({})", self.server_name, request.name, Self::short_id(request_id));
         self.set_start_time(request_id, "call_tool").await;
+        MiddlewareResult::Continue
     }
 
     async fn after_call_tool(&self, request_id: Uuid, result: &std::result::Result<CallToolResult, ServiceError>) {
@@ -289,7 +290,7 @@ mod tests {
             let mw = middleware.clone();
             async move {
                 let request_id = Uuid::new_v4();
-                mw.before_call_tool(request_id, &CallToolRequestParam {
+                let _result = mw.before_call_tool(request_id, &CallToolRequestParam {
                     name: "test".to_string().into(),
                     arguments: None,
                 }).await;
