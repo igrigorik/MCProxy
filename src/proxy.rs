@@ -655,12 +655,7 @@ impl ProxyServer {
         let search_middleware = search_middleware
             .ok_or_else(|| McpError::internal_error("Tool search middleware not found".to_string(), None))?;
         
-        // Get cached tools for search indexing
-        tracing::debug!("Getting cached tools for search");
-        let current_tools = self.get_all_tools_from_cache().await;
-        search_middleware.refresh_tool_index(&current_tools).await;
-        
-        // Perform the search
+        // Perform the search - index should already be built and current
         let search_results = search_middleware.search_tools(query).await;
         
         if search_results.is_empty() {
