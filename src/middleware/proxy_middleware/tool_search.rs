@@ -21,15 +21,15 @@ pub struct ToolSearchMiddlewareConfig {
     /// Whether tool search is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    
+
     /// Maximum number of tools to expose initially and return in search results
     #[serde(default = "default_max_tools_limit", rename = "maxToolsLimit")]
     pub max_tools_limit: usize,
-    
+
     /// Minimum score threshold for search results
     #[serde(default = "default_search_threshold", rename = "searchThreshold")]
     pub search_threshold: f32,
-    
+
     /// Tool selection order for initial exposure
     #[serde(default = "default_tool_selection_order", rename = "toolSelectionOrder")]
     pub tool_selection_order: Vec<String>,
@@ -61,8 +61,6 @@ impl Default for ToolSearchMiddlewareConfig {
         }
     }
 }
-
-
 
 /// Tool search middleware that provides selective tool exposure and search functionality
 pub struct ToolSearchMiddleware {
@@ -176,7 +174,7 @@ impl ToolSearchMiddleware {
         // Update the index
         let mut index_guard = self.index.write().await;
         *index_guard = Some(index);
-        
+
         debug!("Updated tantivy index with {} tools", tools.len());
     }
 
@@ -194,7 +192,7 @@ impl ToolSearchMiddleware {
         }
 
         let mut selected_tools = tools.to_vec();
-        
+
         // Apply selection criteria based on configuration
         for criteria in &self.config.tool_selection_order {
             match criteria.as_str() {
@@ -207,7 +205,7 @@ impl ToolSearchMiddleware {
                     selected_tools.sort_by(|a, b| {
                         let server_a = Self::extract_server_name(&a.name);
                         let server_b = Self::extract_server_name(&b.name);
-                        
+
                         // First sort by server name, then by tool name within server
                         match server_a.cmp(&server_b) {
                             std::cmp::Ordering::Equal => a.name.cmp(&b.name),
@@ -224,12 +222,12 @@ impl ToolSearchMiddleware {
                 }
             }
         }
-        
+
         // Take only the first N tools
         selected_tools.truncate(self.config.max_tools_limit);
         selected_tools
     }
-    
+
     /// Extract server name from prefixed tool name
     fn extract_server_name(tool_name: &str) -> &str {
         if let Some(pos) = tool_name.find("___") {
@@ -251,9 +249,9 @@ impl ToolSearchMiddleware {
             },
             "required": ["query"]
         });
-        
+
         let schema_map = schema.as_object().unwrap().clone();
-        
+
         Tool {
             name: "search_available_tools".into(),
             description: Some(format!(
@@ -288,10 +286,10 @@ impl ToolSearchMiddleware {
         let searcher = reader.searcher();
         let searchable_text_field = self.schema.get_field("searchable_text").unwrap();
         let name_field = self.schema.get_field("name").unwrap();
-        
+
         // Create query parser
         let query_parser = QueryParser::for_index(index, vec![searchable_text_field]);
-        
+
         // Parse query - if it fails, try a simpler approach
         let parsed_query = match query_parser.parse_query(query) {
             Ok(query) => query,
@@ -328,16 +326,16 @@ impl ToolSearchMiddleware {
             // Tantivy scores are typically 0-10 range, but can be higher
             // For threshold compatibility, we'll use the raw score and adjust threshold
             let normalized_score = score;
-            
+
             debug!("Document scored {} (normalized: {})", score, normalized_score);
-            
+
             // Apply threshold
             if normalized_score >= tantivy_threshold {
                 // Get the document and extract the tool name
                 if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
                     if let Some(tool_name_field) = doc.get_first(name_field) {
                         let tool_name = tool_name_field.as_str().unwrap_or("");
-                        
+
                         // Find the tool in our storage by matching name
                         if let Some(tool) = tool_storage.iter().find(|t| t.name == tool_name) {
                             results.push(tool.clone());
@@ -355,8 +353,8 @@ impl ToolSearchMiddleware {
                 debug!("Document failed threshold {} with score {}", tantivy_threshold, normalized_score);
             }
         }
-        
-        info!("Search for '{}' returned {} results (threshold: {}, total indexed: {})", 
+
+        info!("Search for '{}' returned {} results (threshold: {}, total indexed: {})",
               query, results.len(), tantivy_threshold, tool_storage.len());
         results
     }
@@ -365,7 +363,7 @@ impl ToolSearchMiddleware {
     pub async fn update_exposed_tools(&self, new_tools: Vec<Tool>) {
         let mut exposed = self.exposed_tools.write().await;
         *exposed = new_tools;
-        
+
         // Mark search tool as injected if we have search results
         let mut injected = self.search_tool_injected.write().await;
         *injected = true;
@@ -393,26 +391,46 @@ impl ProxyMiddleware for ToolSearchMiddleware {
 
         // Update our internal index with all tools
         self.update_tool_index(tools).await;
-        
-        // Select initial tools to expose
+
+        // Check if we have active search results that should be exposed
+        if *self.search_tool_injected.read().await {
+            // Use current exposed tools (search results) instead of initial selection
+            let mut current_exposed = self.exposed_tools.read().await.clone();
+
+            // Ensure search tool is included in the exposed tools
+            if !current_exposed.iter().any(|t| t.name == "search_available_tools") {
+                let total_tools = tools.len();
+                let exposed_count = current_exposed.len();
+                let hidden_count = if total_tools > exposed_count { total_tools - exposed_count } else { 0 };
+                let search_tool = self.create_search_tool(hidden_count);
+                current_exposed.push(search_tool);
+            }
+
+            let result_count = current_exposed.len() - 1; // Calculate before moving
+            *tools = current_exposed;
+            info!("Returning {} search result tools + search tool", result_count);
+            return;
+        }
+
+        // Otherwise, perform initial selection (existing logic)
         let selected_tools = self.select_initial_tools(tools).await;
-        
+
         // If we're limiting tools, inject the search tool
         if tools.len() > self.config.max_tools_limit {
             let hidden_count = tools.len() - selected_tools.len();
             let mut exposed_tools = selected_tools;
-            
+
             // Add the search tool
             let search_tool = self.create_search_tool(hidden_count);
             exposed_tools.push(search_tool);
-            
+
             // Update the exposed tools list
             self.update_exposed_tools(exposed_tools.clone()).await;
-            
+
             // Replace the tools list with our selected + search tool
             *tools = exposed_tools;
-            
-            info!("Limited tools from {} to {} + search tool", 
+
+            info!("Limited tools from {} to {} + search tool",
                   tools.len() + hidden_count - 1, // -1 because we added search tool
                   self.config.max_tools_limit);
         } else {
@@ -428,9 +446,9 @@ impl ProxyMiddleware for ToolSearchMiddleware {
     }
 
     async fn on_list_resources(&self, _resources: &mut Vec<Resource>) {
-        // Tool search doesn't affect resources  
+        // Tool search doesn't affect resources
     }
-    
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
@@ -449,11 +467,11 @@ impl ProxyMiddlewareFactory for ToolSearchMiddlewareFactory {
                 ProxyError::config(format!("Invalid tool search configuration: {}", e))
             })?
         };
-        
+
         let middleware = ToolSearchMiddleware::new(search_config);
         Ok(Arc::new(middleware))
     }
-    
+
     fn middleware_type(&self) -> &'static str {
         "tool_search"
     }
@@ -471,7 +489,7 @@ mod tests {
             "properties": {}
         });
         let schema_map = schema.as_object().unwrap().clone();
-        
+
         Tool {
             name: name.to_string().into(),
             description: Some(description.to_string().into()),
@@ -493,22 +511,22 @@ mod tests {
     async fn test_tool_indexing() {
         let config = create_test_config(50, 0.1);
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let tools = vec![
             create_test_tool("server1___file_search", "Search for files in the filesystem"),
             create_test_tool("server2___web_scrape", "Scrape content from web pages"),
         ];
-        
+
         middleware.update_tool_index(&tools).await;
-        
+
         // Verify index was created
         let index = middleware.index.read().await;
         assert!(index.is_some());
-        
+
         // Verify tool storage has correct count
         let tool_storage = middleware.tool_storage.read().await;
         assert_eq!(tool_storage.len(), 2);
-        
+
         // Verify tools can be found by search
         let results = middleware.search_tools("file_search").await;
         assert_eq!(results.len(), 1);
@@ -519,24 +537,24 @@ mod tests {
     async fn test_fuzzy_search() {
         let config = create_test_config(50, 0.05); // Very low threshold for testing
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let tools = vec![
             create_test_tool("server1___file_search", "Search for files in the filesystem"),
             create_test_tool("server1___file_write", "Write content to a file"),
             create_test_tool("server2___web_scrape", "Scrape content from web pages"),
             create_test_tool("server2___web_download", "Download files from the web"),
         ];
-        
+
         middleware.update_tool_index(&tools).await;
-        
+
         // Test search for "file" - should match file-related tools
         let results = middleware.search_tools("file").await;
         assert!(results.len() >= 1, "Should find at least 1 file-related tool");
-        
-        // Test search for "web" - should match web-related tools  
+
+        // Test search for "web" - should match web-related tools
         let results = middleware.search_tools("web").await;
         assert!(results.len() >= 1, "Should find at least 1 web-related tool");
-        
+
         // Test search for exact match
         let results = middleware.search_tools("file_search").await;
         assert!(results.len() >= 1);
@@ -547,13 +565,13 @@ mod tests {
     async fn test_search_threshold() {
         let config = create_test_config(50, 0.9); // High threshold
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let tools = vec![
             create_test_tool("server1___completely_different_tool", "A tool that does something else"),
         ];
-        
+
         middleware.update_tool_index(&tools).await;
-        
+
         // Search for something that doesn't match well - should return no results
         let results = middleware.search_tools("xyz").await;
         assert!(results.is_empty());
@@ -563,16 +581,16 @@ mod tests {
     async fn test_search_result_limit() {
         let config = create_test_config(2, 0.1); // Limit to 2 results
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let tools = vec![
             create_test_tool("server1___file_search", "Search for files"),
             create_test_tool("server1___file_write", "Write files"),
             create_test_tool("server1___file_read", "Read files"),
             create_test_tool("server1___file_delete", "Delete files"),
         ];
-        
+
         middleware.update_tool_index(&tools).await;
-        
+
         let results = middleware.search_tools("file").await;
         assert!(results.len() <= 2);
     }
@@ -581,22 +599,22 @@ mod tests {
     async fn test_selective_tool_exposure() {
         let config = create_test_config(2, 0.3); // Only expose 2 tools initially
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let mut tools = vec![
             create_test_tool("server1___zebra_tool", "Tool starting with Z"),
             create_test_tool("server1___alpha_tool", "Tool starting with A"),
             create_test_tool("server1___beta_tool", "Tool starting with B"),
         ];
-        
+
         // Apply middleware - should limit tools and add search tool
         middleware.on_list_tools(&mut tools).await;
-        
+
         // Should have 2 original tools + 1 search tool = 3 total
         assert_eq!(tools.len(), 3);
-        
+
         // Should have the search tool
         assert!(tools.iter().any(|t| t.name == "search_available_tools"));
-        
+
         // Should have alphabetically sorted tools (alpha_tool, beta_tool)
         let non_search_tools: Vec<_> = tools.iter()
             .filter(|t| t.name != "search_available_tools")
@@ -610,20 +628,20 @@ mod tests {
     async fn test_no_limiting_when_under_threshold() {
         let config = create_test_config(50, 0.3); // High limit
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let mut tools = vec![
             create_test_tool("server1___tool1", "Tool 1"),
             create_test_tool("server1___tool2", "Tool 2"),
         ];
-        
+
         let original_count = tools.len();
-        
+
         // Apply middleware - should not limit tools or add search tool
         middleware.on_list_tools(&mut tools).await;
-        
+
         // Should have the same number of tools (no search tool added)
         assert_eq!(tools.len(), original_count);
-        
+
         // Should not have the search tool
         assert!(!tools.iter().any(|t| t.name == "search_available_tools"));
     }
@@ -632,13 +650,13 @@ mod tests {
     async fn test_search_tool_creation() {
         let config = create_test_config(50, 0.3);
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let search_tool = middleware.create_search_tool(25);
-        
+
         assert_eq!(search_tool.name, "search_available_tools");
         assert!(search_tool.description.is_some());
         assert!(search_tool.description.as_ref().unwrap().contains("25 additional"));
-        
+
         // Verify schema structure
         let schema = &search_tool.input_schema;
         assert!(schema.get("type").is_some());
@@ -646,11 +664,11 @@ mod tests {
         assert!(schema.get("required").is_some());
     }
 
-    #[tokio::test]
+        #[tokio::test]
     async fn test_search_flow_with_notification() {
         let config = create_test_config(2, 0.05); // Only expose 2 tools initially
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         // Setup initial tools
         let mut tools = vec![
             create_test_tool("server1___file_search", "Search for files"),
@@ -658,36 +676,79 @@ mod tests {
             create_test_tool("server1___web_scrape", "Scrape web pages"),
             create_test_tool("server1___web_download", "Download files"),
         ];
-        
+
         // Apply middleware to simulate initial tool limiting
         middleware.on_list_tools(&mut tools).await;
-        
+
         // Should have 2 original tools + 1 search tool = 3 total
         assert_eq!(tools.len(), 3);
         assert!(tools.iter().any(|t| t.name == "search_available_tools"));
-        
+
         // Perform search
         let search_results = middleware.search_tools("web").await;
         assert!(search_results.len() >= 2, "Should find web-related tools");
-        
+
         // Update exposed tools (this is what happens in handle_search_tool_call)
         middleware.update_exposed_tools(search_results.clone()).await;
-        
+
         // Verify the search tool is now injected
         assert!(middleware.is_search_tool_injected().await);
-        
+
         // Get the new exposed tools
         let exposed_tools = middleware.get_exposed_tools().await;
-        
+
         // Should have the search results
         assert_eq!(exposed_tools.len(), search_results.len());
         assert!(exposed_tools.iter().any(|t| t.name.contains("web")));
     }
 
+    #[tokio::test]
+    async fn test_tools_list_returns_search_results_after_search() {
+        let config = create_test_config(2, 0.05); // Only expose 2 tools initially
+        let middleware = ToolSearchMiddleware::new(config);
+
+        // Setup initial tools
+        let original_tools = vec![
+            create_test_tool("server1___file_search", "Search for files"),
+            create_test_tool("server1___file_write", "Write files"),
+            create_test_tool("server1___web_scrape", "Scrape web pages"),
+            create_test_tool("server1___web_download", "Download files"),
+        ];
+
+        // Apply middleware to simulate initial tool limiting
+        let mut tools_for_client = original_tools.clone();
+        middleware.on_list_tools(&mut tools_for_client).await;
+
+        // Should have 2 original tools + 1 search tool = 3 total
+        assert_eq!(tools_for_client.len(), 3);
+        assert!(tools_for_client.iter().any(|t| t.name == "search_available_tools"));
+
+        // Perform search (simulating search_available_tools call)
+        let search_results = middleware.search_tools("web").await;
+        assert!(search_results.len() >= 2, "Should find web-related tools");
+
+        // Update exposed tools (this is what happens in handle_search_tool_call)
+        middleware.update_exposed_tools(search_results.clone()).await;
+
+        // Now simulate a client calling tools/list after receiving notification
+        let mut tools_after_search = original_tools.clone();
+        middleware.on_list_tools(&mut tools_after_search).await;
+
+        // Should now return search results + search tool (not the original limited set)
+        assert!(tools_after_search.len() >= 3, "Should have search results + search tool");
+        assert!(tools_after_search.iter().any(|t| t.name == "search_available_tools"));
+        assert!(tools_after_search.iter().any(|t| t.name.contains("web_scrape")));
+        assert!(tools_after_search.iter().any(|t| t.name.contains("web_download")));
+
+        // Should NOT have the original limited tools (file_search, file_write)
+        assert!(!tools_after_search.iter().any(|t| t.name.contains("file_search")));
+        assert!(!tools_after_search.iter().any(|t| t.name.contains("file_write")));
+    }
+
     #[test]
     fn test_middleware_config_defaults() {
         let config = ToolSearchMiddlewareConfig::default();
-        
+
         assert!(config.enabled);
         assert_eq!(config.max_tools_limit, 50);
         assert_eq!(config.search_threshold, 0.1);
@@ -697,19 +758,19 @@ mod tests {
     #[test]
     fn test_middleware_factory() {
         let factory = ToolSearchMiddlewareFactory;
-        
+
         assert_eq!(factory.middleware_type(), "tool_search");
-        
+
         // Test with null config (should use defaults)
         let middleware = factory.create(&serde_json::Value::Null).unwrap();
         assert!(middleware.as_any().is_some());
-        
+
         // Test with custom config
         let config = serde_json::json!({
             "enabled": true,
             "maxToolsLimit": 25
         });
-        
+
         let middleware = factory.create(&config).unwrap();
         assert!(middleware.as_any().is_some());
     }
@@ -718,14 +779,14 @@ mod tests {
     async fn test_update_exposed_tools() {
         let config = create_test_config(50, 0.3);
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         let new_tools = vec![
             create_test_tool("server1___tool1", "Tool 1"),
             create_test_tool("server2___tool2", "Tool 2"),
         ];
-        
+
         middleware.update_exposed_tools(new_tools.clone()).await;
-        
+
         let exposed = middleware.get_exposed_tools().await;
         assert_eq!(exposed.len(), 2);
         assert!(middleware.is_search_tool_injected().await);
@@ -735,7 +796,7 @@ mod tests {
     async fn test_github_style_search() {
         let config = create_test_config(50, 0.05); // Very low threshold for testing
         let middleware = ToolSearchMiddleware::new(config);
-        
+
         // Create tools that match the actual GitHub tools from the logs
         let tools = vec![
             create_test_tool("github___add_issue_comment", "Add a comment to a specific issue in a GitHub repository"),
@@ -745,27 +806,27 @@ mod tests {
             create_test_tool("buildkite___get_build_info", "Get basic metadata about a buildkite build"),
             create_test_tool("vault___get_user", "Get user information from vault"),
         ];
-        
+
         middleware.update_tool_index(&tools).await;
-        
+
         // Test search for "github" - should match all GitHub tools
         let results = middleware.search_tools("github").await;
         assert!(results.len() >= 4, "Should find at least 4 GitHub tools");
         assert!(results.iter().any(|t| t.name.contains("add_issue_comment")));
         assert!(results.iter().any(|t| t.name.contains("create_issue")));
-        
+
         // Test search for "issue" - should match issue-related tools
         let results = middleware.search_tools("issue").await;
         assert!(results.len() >= 3, "Should find at least 3 issue-related tools");
-        
+
         // Test search for "github issue" - should match issue-related GitHub tools
         let results = middleware.search_tools("github issue").await;
         assert!(results.len() >= 3, "Should find at least 3 GitHub issue tools");
-        
+
         // Test search for "issue comment" - should match issue comment tools
         let results = middleware.search_tools("issue comment").await;
         assert!(results.len() >= 1, "Should find at least 1 issue comment tool");
-        
+
         // Test search for "GitHub repository" - should match issue-related tools
         let results = middleware.search_tools("GitHub repository").await;
         assert!(results.len() >= 3, "Should find at least 3 GitHub repository tools");
@@ -852,11 +913,11 @@ mod tests {
 
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body_str = String::from_utf8(body.to_vec()).unwrap();
-            
+
             // Parse SSE stream - should contain an error response
             let sse_lines: Vec<&str> = body_str.lines().collect();
             let mut found_error = false;
-            
+
             for line in sse_lines {
                 if line.starts_with("data: ") {
                     let data_part = &line[6..]; // Remove "data: " prefix
@@ -870,7 +931,7 @@ mod tests {
                     }
                 }
             }
-            
+
             assert!(found_error, "Expected to find error about missing query parameter");
         }
 
@@ -909,12 +970,12 @@ mod tests {
 
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body_str = String::from_utf8(body.to_vec()).unwrap();
-            
+
             // Parse SSE stream - should contain notification and response
             let sse_lines: Vec<&str> = body_str.lines().collect();
             let mut found_notification = false;
             let mut found_response = false;
-            
+
             for line in sse_lines {
                 if line.starts_with("data: ") {
                     let data_part = &line[6..]; // Remove "data: " prefix
@@ -925,7 +986,7 @@ mod tests {
                                 found_notification = true;
                             }
                         }
-                        
+
                         // Check for result response
                         if let Some(result) = event_data.get("result") {
                             assert_eq!(event_data["jsonrpc"], "2.0");
@@ -936,7 +997,7 @@ mod tests {
                     }
                 }
             }
-            
+
             // With empty query, we should still get notification and response
             assert!(found_notification, "Expected to find tools/list_changed notification");
             assert!(found_response, "Expected to find search result response");
@@ -965,15 +1026,15 @@ mod tests {
 
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body: Value = serde_json::from_slice(&body).unwrap();
-            
+
             assert_eq!(body["jsonrpc"], "2.0");
             assert_eq!(body["id"], 1);
             assert!(body["result"].is_object());
 
             let _tools = body["result"]["tools"].as_array().unwrap();
-            
+
             // Since we don't have actual servers connected, we should have 0 tools
             // but the middleware should still work without errors - just getting here confirms success
         }
     }
-} 
+}
