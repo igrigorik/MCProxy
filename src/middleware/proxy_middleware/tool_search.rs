@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Schema, TEXT, STORED};
+use tantivy::schema::{Schema, TEXT, STORED, Value};
 use tantivy::{doc, Index};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -287,6 +287,7 @@ impl ToolSearchMiddleware {
 
         let searcher = reader.searcher();
         let searchable_text_field = self.schema.get_field("searchable_text").unwrap();
+        let name_field = self.schema.get_field("name").unwrap();
         
         // Create query parser
         let query_parser = QueryParser::for_index(index, vec![searchable_text_field]);
@@ -332,13 +333,23 @@ impl ToolSearchMiddleware {
             
             // Apply threshold
             if normalized_score >= tantivy_threshold {
-                // Get tool by document address (using docid as index)
-                let doc_id = doc_address.doc_id as usize;
-                if let Some(tool) = tool_storage.get(doc_id) {
-                    results.push(tool.clone());
-                    debug!("Tool '{}' passed threshold with score {}", tool.name, normalized_score);
+                // Get the document and extract the tool name
+                if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
+                    if let Some(tool_name_field) = doc.get_first(name_field) {
+                        let tool_name = tool_name_field.as_str().unwrap_or("");
+                        
+                        // Find the tool in our storage by matching name
+                        if let Some(tool) = tool_storage.iter().find(|t| t.name == tool_name) {
+                            results.push(tool.clone());
+                            debug!("Tool '{}' passed threshold with score {}", tool.name, normalized_score);
+                        } else {
+                            debug!("Tool '{}' not found in storage", tool_name);
+                        }
+                    } else {
+                        debug!("Document missing name field");
+                    }
                 } else {
-                    debug!("Tool not found for doc_id {}", doc_id);
+                    debug!("Failed to retrieve document for address {:?}", doc_address);
                 }
             } else {
                 debug!("Document failed threshold {} with score {}", tantivy_threshold, normalized_score);
@@ -635,7 +646,43 @@ mod tests {
         assert!(schema.get("required").is_some());
     }
 
-
+    #[tokio::test]
+    async fn test_search_flow_with_notification() {
+        let config = create_test_config(2, 0.05); // Only expose 2 tools initially
+        let middleware = ToolSearchMiddleware::new(config);
+        
+        // Setup initial tools
+        let mut tools = vec![
+            create_test_tool("server1___file_search", "Search for files"),
+            create_test_tool("server1___file_write", "Write files"),
+            create_test_tool("server1___web_scrape", "Scrape web pages"),
+            create_test_tool("server1___web_download", "Download files"),
+        ];
+        
+        // Apply middleware to simulate initial tool limiting
+        middleware.on_list_tools(&mut tools).await;
+        
+        // Should have 2 original tools + 1 search tool = 3 total
+        assert_eq!(tools.len(), 3);
+        assert!(tools.iter().any(|t| t.name == "search_available_tools"));
+        
+        // Perform search
+        let search_results = middleware.search_tools("web").await;
+        assert!(search_results.len() >= 2, "Should find web-related tools");
+        
+        // Update exposed tools (this is what happens in handle_search_tool_call)
+        middleware.update_exposed_tools(search_results.clone()).await;
+        
+        // Verify the search tool is now injected
+        assert!(middleware.is_search_tool_injected().await);
+        
+        // Get the new exposed tools
+        let exposed_tools = middleware.get_exposed_tools().await;
+        
+        // Should have the search results
+        assert_eq!(exposed_tools.len(), search_results.len());
+        assert!(exposed_tools.iter().any(|t| t.name.contains("web")));
+    }
 
     #[test]
     fn test_middleware_config_defaults() {
@@ -703,44 +750,24 @@ mod tests {
         
         // Test search for "github" - should match all GitHub tools
         let results = middleware.search_tools("github").await;
-        println!("Search for 'github' returned {} results", results.len());
-        for tool in &results {
-            println!("  - {}", tool.name);
-        }
         assert!(results.len() >= 4, "Should find at least 4 GitHub tools");
         assert!(results.iter().any(|t| t.name.contains("add_issue_comment")));
         assert!(results.iter().any(|t| t.name.contains("create_issue")));
         
         // Test search for "issue" - should match issue-related tools
         let results = middleware.search_tools("issue").await;
-        println!("Search for 'issue' returned {} results", results.len());
-        for tool in &results {
-            println!("  - {}", tool.name);
-        }
         assert!(results.len() >= 3, "Should find at least 3 issue-related tools");
         
         // Test search for "github issue" - should match issue-related GitHub tools
         let results = middleware.search_tools("github issue").await;
-        println!("Search for 'github issue' returned {} results", results.len());
-        for tool in &results {
-            println!("  - {}", tool.name);
-        }
         assert!(results.len() >= 3, "Should find at least 3 GitHub issue tools");
         
         // Test search for "issue comment" - should match issue comment tools
         let results = middleware.search_tools("issue comment").await;
-        println!("Search for 'issue comment' returned {} results", results.len());
-        for tool in &results {
-            println!("  - {}", tool.name);
-        }
         assert!(results.len() >= 1, "Should find at least 1 issue comment tool");
         
         // Test search for "GitHub repository" - should match issue-related tools
         let results = middleware.search_tools("GitHub repository").await;
-        println!("Search for 'GitHub repository' returned {} results", results.len());
-        for tool in &results {
-            println!("  - {}", tool.name);
-        }
         assert!(results.len() >= 3, "Should find at least 3 GitHub repository tools");
     }
 
