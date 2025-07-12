@@ -9,12 +9,13 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
   - **ClientMiddleware**: Operates on individual server calls (logging, tool filtering, payload inspection for security, etc)
   - **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (description enrichment, tool search, etc)
 
-**Built-in middleware** (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)): 
+**Built-in middleware** (see [docs/MIDDLEWARE.md](docs/MIDDLEWARE.md)):
   - **Logging**: Logs all operations with timing information per server
   - **Tool filtering**: Filters tools based on configurable regex patterns (allow/disallow)
   - **Tool security**: Inspects tool call inputs and blocks calls that match security rules
   - **Tool enrichment**: Augments tool/prompt/resource descriptions (demo)
-  - **Tool search**: Provides intelligent tool management with selective exposure and search functionality (see [docs/SEARCH.md](docs/SEARCH.md))
+  - **Tool search**: Provides intelligent tool management with selective exposure and search functionality (see [docs/SEARCH.md](docs/SEARCH.md)).
+    - Disclaimer: cursor does not currently support dynamic tool refresh ([1](https://forum.cursor.com/t/mcp-hosted-dynamic-tools-refreshing/49693), [2](https://forum.cursor.com/t/mcp-client-update-tools/77294)), you have to manually toggle the tool.
 
 
 ## Usage
@@ -35,7 +36,7 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
 
 ## Configuration
 
-The proxy is configured using a JSON file passed as a command-line argument. The file should contain the `mcpServers` key (MCP configuration you use for VSCode/Cursor/Claude/etc), plus `httpServer` key to configure the MCP proxy: 
+The proxy is configured using a JSON file passed as a command-line argument. The file should contain the `mcpServers` key (MCP configuration you use for VSCode/Cursor/Claude/etc), plus `httpServer` key to configure the MCP proxy:
 
 ```json
 {
