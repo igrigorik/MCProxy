@@ -53,6 +53,16 @@
           }
         ],
         "servers": {
+          "file-server": [
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "allow": "*_file",
+                "disallow": "delete_.*|remove_.*"
+              }
+            }
+          ],
           "critical-api": [
             {
               "type": "security",
