@@ -37,7 +37,7 @@
           "enabled": true,
           "config": {
             "maxToolsLimit": 50,
-            "searchThreshold": 0.3,
+            "searchThreshold": 0.1,
             "toolSelectionOrder": [
               "server_priority"
             ]

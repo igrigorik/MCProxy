@@ -5,6 +5,7 @@
 //! - Health check endpoint at `/health`
 //! - Configurable CORS support
 //! - Request routing to appropriate MCP methods
+//! - SSE streaming support for compatible tools
 //! 
 //! # JSON-RPC Implementation
 //! 
@@ -12,9 +13,16 @@
 //! - `initialize`: Get server information and capabilities
 //! - `ping`: Simple connectivity check
 //! - `tools/list`: List all available tools from all servers
-//! - `tools/call`: Execute a tool on the appropriate server
+//! - `tools/call`: Execute a tool on the appropriate server (with SSE support for compatible tools)
 //! - `prompts/list`: List all available prompts
 //! - `resources/list`: List all available resources
+//! 
+//! # SSE Streaming for Compatible Tools
+//! 
+//! When compatible tools are called, the server responds with SSE streaming:
+//! 1. Sends appropriate notification (e.g., `tools/list_changed` for search tools)
+//! 2. Sends the actual tool response
+//! 3. Closes the stream
 //! 
 //! # Error Handling
 //! 
@@ -29,7 +37,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     extract::State,
     http::StatusCode,
-    response::Json,
+    response::{Json, Response, IntoResponse},
     routing::post,
     Router,
 };
@@ -42,6 +50,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
+use axum::response::sse::{Event, Sse};
+use futures::stream::{self, Stream};
+use futures::StreamExt;
 
 use crate::{config::HttpServerConfig, proxy::ProxyServer};
 
@@ -155,11 +166,104 @@ pub fn parse_bind_address(http_config: &HttpServerConfig) -> Result<SocketAddr, 
         .map_err(|e| format!("Invalid bind address '{}': {}", bind_address_str, e))
 }
 
+/// Check if this request should use SSE streaming response
+fn is_sse_response(method: &str, params: &Option<Value>) -> bool {
+    if method != "tools/call" {
+        return false;
+    }
+    
+    if let Some(params) = params {
+        if let Some(tool_name) = params.get("name").and_then(|v| v.as_str()) {
+            // List of tools that support SSE streaming
+            match tool_name {
+                "search_available_tools" => true,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// Create SSE stream for tool calls that support streaming
+async fn create_tool_sse_stream(
+    proxy: Arc<ProxyServer>,
+    request_id: Option<Value>,
+    params: Option<Value>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    let call_params: CallToolRequestParam = match parse_required_params(params, "tools/call") {
+        Ok(params) => params,
+        Err(e) => {
+            let error_response = JsonRpcResponse::error(request_id, e.into());
+            let error_event = Event::default()
+                .data(serde_json::to_string(&error_response).unwrap_or_default());
+            return stream::once(async { Ok(error_event) }).boxed();
+        }
+    };
+
+    // Perform the tool call
+    let tool_result = proxy.call_tool_on_server(&call_params.name, call_params.arguments).await;
+    
+    let events = match tool_result {
+        Ok(result) => {
+            // Create notification event based on tool type
+            let notification = match call_params.name.as_ref() {
+                "search_available_tools" => {
+                    // For search tools, send tools/list_changed notification
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                        "params": null
+                    })
+                }
+                _ => {
+                    // Default notification for unknown streaming tools
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/unknown",
+                        "params": null
+                    })
+                }
+            };
+            
+            let notification_event = Event::default()
+                .data(serde_json::to_string(&notification).unwrap_or_default());
+            
+            // Create response event - serialize the result properly
+            let result_value = match serialize_result(result) {
+                Ok(val) => val,
+                Err(e) => {
+                    let error_response = JsonRpcResponse::error(request_id, e.into());
+                    let error_event = Event::default()
+                        .data(serde_json::to_string(&error_response).unwrap_or_default());
+                    return stream::once(async { Ok(error_event) }).boxed();
+                }
+            };
+            
+            let response = JsonRpcResponse::success(request_id, result_value);
+            let response_event = Event::default()
+                .data(serde_json::to_string(&response).unwrap_or_default());
+            
+            vec![Ok(notification_event), Ok(response_event)]
+        }
+        Err(e) => {
+            let error_response = JsonRpcResponse::error(request_id, e.into());
+            let error_event = Event::default()
+                .data(serde_json::to_string(&error_response).unwrap_or_default());
+            vec![Ok(error_event)]
+        }
+    };
+    
+    stream::iter(events).boxed()
+}
+
 /// Fully compliant MCP endpoint that handles JSON-RPC 2.0 requests
 async fn mcp_handler(
     State(proxy): State<SharedProxyServer>,
     Json(request): Json<Value>,
-) -> Result<Json<JsonRpcResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     // Parse JSON-RPC request
     let json_rpc_request: JsonRpcRequest = match serde_json::from_value(request) {
         Ok(req) => req,
@@ -173,7 +277,7 @@ async fn mcp_handler(
                     data: Some(serde_json::json!({ "details": e.to_string() })),
                 },
             );
-            return Ok(Json(response));
+            return Ok(Json(response).into_response());
         }
     };
 
@@ -187,12 +291,28 @@ async fn mcp_handler(
                 data: Some(serde_json::json!({ "details": "Only JSON-RPC 2.0 is supported" })),
             },
         );
-        return Ok(Json(response));
+        return Ok(Json(response).into_response());
     }
 
     tracing::debug!("Processing MCP request: {} (id: {:?})", json_rpc_request.method, json_rpc_request.id);
 
-    // Route MCP method to appropriate handler
+    // Check if this request should use SSE streaming
+    if is_sse_response(&json_rpc_request.method, &json_rpc_request.params) {
+        tracing::info!("Using SSE streaming for tool call");
+        
+        let stream = create_tool_sse_stream(
+            proxy,
+            json_rpc_request.id,
+            json_rpc_request.params,
+        ).await;
+        
+        let sse_response = Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default());
+        
+        return Ok(sse_response.into_response());
+    }
+
+    // Regular JSON-RPC handling for non-search tools
     let result = route_mcp_method(&proxy, json_rpc_request.method.as_str(), json_rpc_request.params).await;
     
     let response = match result {
@@ -200,7 +320,7 @@ async fn mcp_handler(
         Err(error) => JsonRpcResponse::error(json_rpc_request.id, error.into()),
     };
 
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 /// Helper to parse optional parameters
@@ -278,29 +398,6 @@ async fn route_mcp_method(
                 resources,
                 next_cursor: None,
             })
-        }
-        
-        "notifications/poll" => {
-            #[derive(serde::Deserialize)]
-            struct NotificationPollParams {
-                #[serde(rename = "sinceTimestamp")]
-                since_timestamp: Option<u64>,
-            }
-            
-            let poll_params: Option<NotificationPollParams> = parse_optional_params(params, "notifications/poll")?;
-            let since_timestamp = poll_params.and_then(|p| p.since_timestamp);
-            
-            let notifications = proxy.notification_manager()
-                .get_notifications_since(since_timestamp)
-                .await;
-            
-            serialize_result(serde_json::json!({
-                "notifications": notifications,
-                "timestamp": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            }))
         }
         
         _ => {

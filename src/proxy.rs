@@ -33,89 +33,13 @@ use rmcp::{
     Error as McpError, ServerHandler,
 };
 use sse_stream::{Error as SseError, Sse};
-use std::{collections::HashMap, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, sync::Arc};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use reqwest;
 
-/// Represents a notification to be delivered to clients
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PendingNotification {
-    pub id: String,
-    pub method: String,
-    pub params: Option<serde_json::Value>,
-    pub timestamp: u64,
-}
 
-/// Manages notifications for clients
-#[derive(Debug, Default)]
-pub struct NotificationManager {
-    /// Global notifications that all clients should receive
-    global_notifications: Arc<RwLock<Vec<PendingNotification>>>,
-}
-
-impl NotificationManager {
-    pub fn new() -> Self {
-        Self {
-            global_notifications: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    /// Add a global notification that all clients should receive
-    pub async fn add_global_notification(&self, method: String, params: Option<serde_json::Value>) {
-        let method_clone = method.clone();
-        let notification = PendingNotification {
-            id: uuid::Uuid::new_v4().to_string(),
-            method,
-            params,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        };
-
-        let mut notifications = self.global_notifications.write().await;
-        notifications.push(notification);
-        
-        // Keep only the last 100 notifications to prevent memory growth
-        let len = notifications.len();
-        if len > 100 {
-            notifications.drain(0..len - 100);
-        }
-        
-        tracing::info!("Added global notification: {}", method_clone);
-    }
-
-    /// Get all notifications since a given timestamp
-    pub async fn get_notifications_since(&self, since_timestamp: Option<u64>) -> Vec<PendingNotification> {
-        let notifications = self.global_notifications.read().await;
-        
-        if let Some(since) = since_timestamp {
-            notifications
-                .iter()
-                .filter(|n| n.timestamp > since)
-                .cloned()
-                .collect()
-        } else {
-            // Return last 10 notifications if no timestamp provided
-            let start_idx = if notifications.len() > 10 {
-                notifications.len() - 10
-            } else {
-                0
-            };
-            notifications[start_idx..].to_vec()
-        }
-    }
-
-    /// Send a toolListChanged notification
-    pub async fn notify_tools_changed(&self) {
-        self.add_global_notification(
-            "notifications/tools/list_changed".to_string(),
-            None
-        ).await;
-    }
-}
 
 /// The main proxy server that aggregates multiple MCP servers
 #[derive(Clone)]
@@ -128,8 +52,6 @@ pub struct ProxyServer {
     process_handles: Arc<RwLock<HashMap<String, Child>>>,
     /// The middleware manager
     middleware: Arc<MiddlewareManager>,
-    /// Notification manager for sending notifications to clients
-    notification_manager: Arc<NotificationManager>,
 }
 
 /// Represents a connected MCP server
@@ -223,17 +145,18 @@ impl ProxyServer {
         let servers = Arc::new(RwLock::new(HashMap::new()));
         let process_handles = Arc::new(RwLock::new(HashMap::new()));
         let middleware = Arc::new(MiddlewareManager::from_config(&config)?);
-        let notification_manager = Arc::new(NotificationManager::new());
         let proxy = ProxyServer {
             servers: servers.clone(),
             config: Arc::new(config.clone()),
             process_handles,
             middleware,
-            notification_manager,
         };
 
         // Connect to all configured servers
         proxy.connect_to_all_servers().await?;
+
+        // Initialize tool search index after all servers are connected
+        proxy.initialize_tool_search_index().await;
 
         Ok(proxy)
     }
@@ -659,10 +582,7 @@ impl ProxyServer {
         all_resources
     }
 
-    /// Get the notification manager
-    pub fn notification_manager(&self) -> Arc<NotificationManager> {
-        self.notification_manager.clone()
-    }
+
 
     /// Find and call a tool on the appropriate server
     pub async fn call_tool_on_server(
@@ -735,6 +655,11 @@ impl ProxyServer {
         let search_middleware = search_middleware
             .ok_or_else(|| McpError::internal_error("Tool search middleware not found".to_string(), None))?;
         
+        // Get cached tools for search indexing
+        tracing::debug!("Getting cached tools for search");
+        let current_tools = self.get_all_tools_from_cache().await;
+        search_middleware.refresh_tool_index(&current_tools).await;
+        
         // Perform the search
         let search_results = search_middleware.search_tools(query).await;
         
@@ -763,15 +688,51 @@ impl ProxyServer {
             // Update the exposed tools with search results
             search_middleware.update_exposed_tools(search_results).await;
             
-            // Send toolListChanged notification to clients
-            self.notification_manager.notify_tools_changed().await;
-            
             Ok(CallToolResult {
                 content: vec![
                     Content::text(result_text)
                 ],
                 is_error: Some(false),
             })
+        }
+    }
+
+    /// Get all tools from cached server objects (used for search indexing)
+    /// This uses the cached tools that were fetched during server boot instead of refetching
+    async fn get_all_tools_from_cache(&self) -> Vec<Tool> {
+        let mut all_tools = Vec::new();
+        let servers = self.servers.read().await;
+
+        for (server_name, server) in servers.iter() {
+            // Use cached tools from the server object
+            for tool in &server.tools {
+                let mut prefixed_tool = tool.clone();
+                // Prefix tool names with server name to avoid conflicts
+                prefixed_tool.name = Self::prefix_with_server(server_name, &tool.name).into();
+                all_tools.push(prefixed_tool);
+            }
+        }
+
+        tracing::debug!("Retrieved {} tools from cache for indexing", all_tools.len());
+        all_tools
+    }
+
+    /// Initialize the tool search index after all servers are connected
+    async fn initialize_tool_search_index(&self) {
+        tracing::info!("Initializing tool search index...");
+        let current_tools = self.get_all_tools_from_cache().await;
+        
+        // Find the tool search middleware
+        if let Some(search_middleware) = self.middleware.proxy.iter()
+            .find_map(|mw| {
+                mw.as_any()
+                    .and_then(|any| any.downcast_ref::<crate::middleware::proxy_middleware::tool_search::ToolSearchMiddleware>())
+            })
+        {
+            search_middleware.refresh_tool_index(&current_tools).await;
+            tracing::info!("Tool search index initialized with {} tools", current_tools.len());
+        } else {
+            tracing::debug!("Tool search middleware not found, skipping index initialization");
         }
     }
 }
@@ -849,3 +810,5 @@ impl ServerHandler for ProxyServer {
         })
     }
 } 
+
+ 

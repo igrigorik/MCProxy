@@ -147,6 +147,13 @@ impl ToolSearchMiddleware {
         debug!("Updated tool index with {} tools", index.len());
     }
 
+    /// Public method to refresh the tool index with current tools
+    /// This is called by the proxy when performing searches to ensure fresh data
+    pub async fn refresh_tool_index(&self, tools: &[Tool]) {
+        self.update_tool_index(tools).await;
+        debug!("Refreshed tool index for search with {} tools", tools.len());
+    }
+
     /// Select initial tools to expose based on configuration
     async fn select_initial_tools(&self, tools: &[Tool]) -> Vec<Tool> {
         if !self.config.enabled || tools.len() <= self.config.max_tools_limit {
@@ -229,12 +236,23 @@ impl ToolSearchMiddleware {
     pub async fn search_tools(&self, query: &str) -> Vec<Tool> {
         let index = self.tool_index.read().await;
         let mut results: Vec<(i64, &IndexedTool)> = Vec::new();
+        let threshold = self.config.search_threshold * 100.0;
+        
+        debug!("Searching for '{}' with threshold {} against {} indexed tools", query, threshold, index.len());
         
         for indexed_tool in index.iter() {
             if let Some(score) = self.matcher.fuzzy_match(&indexed_tool.searchable_text, query) {
-                if score as f32 >= (self.config.search_threshold * 100.0) {
+                debug!("Tool '{}' scored {} against query '{}' (searchable text: '{}')", 
+                       indexed_tool.tool.name, score, query, indexed_tool.searchable_text);
+                
+                if score as f32 >= threshold {
                     results.push((score, indexed_tool));
+                    debug!("Tool '{}' passed threshold with score {}", indexed_tool.tool.name, score);
+                } else {
+                    debug!("Tool '{}' failed threshold {} with score {}", indexed_tool.tool.name, threshold, score);
                 }
+            } else {
+                debug!("Tool '{}' had no fuzzy match score for query '{}'", indexed_tool.tool.name, query);
             }
         }
         
@@ -248,7 +266,8 @@ impl ToolSearchMiddleware {
             .map(|(_, indexed_tool)| indexed_tool.tool.clone())
             .collect();
         
-        info!("Search for '{}' returned {} results", query, search_results.len());
+        info!("Search for '{}' returned {} results (threshold: {}, total indexed: {})", 
+              query, search_results.len(), threshold, index.len());
         search_results
     }
 
@@ -594,6 +613,66 @@ mod tests {
         assert!(middleware.is_search_tool_injected().await);
     }
 
+    #[tokio::test]
+    async fn test_github_style_search() {
+        let config = create_test_config(50, 0.1); // Low threshold for testing
+        let middleware = ToolSearchMiddleware::new(config);
+        
+        // Create tools that match the actual GitHub tools from the logs
+        let tools = vec![
+            create_test_tool("github___add_issue_comment", "Add a comment to a specific issue in a GitHub repository"),
+            create_test_tool("github___create_issue", "Create a new issue in a GitHub repository"),
+            create_test_tool("github___get_issue", "Get details of a specific issue in a GitHub repository"),
+            create_test_tool("github___search_issues", "Search for issues in GitHub repositories using issues search syntax"),
+            create_test_tool("buildkite___get_build_info", "Get basic metadata about a buildkite build"),
+            create_test_tool("vault___get_user", "Get user information from vault"),
+        ];
+        
+        middleware.update_tool_index(&tools).await;
+        
+        // Test search for "github" - should match all GitHub tools
+        let results = middleware.search_tools("github").await;
+        println!("Search for 'github' returned {} results", results.len());
+        for tool in &results {
+            println!("  - {}", tool.name);
+        }
+        assert!(results.len() >= 4, "Should find at least 4 GitHub tools");
+        assert!(results.iter().any(|t| t.name.contains("add_issue_comment")));
+        assert!(results.iter().any(|t| t.name.contains("create_issue")));
+        
+        // Test search for "issue" - should match issue-related tools
+        let results = middleware.search_tools("issue").await;
+        println!("Search for 'issue' returned {} results", results.len());
+        for tool in &results {
+            println!("  - {}", tool.name);
+        }
+        assert!(results.len() >= 3, "Should find at least 3 issue-related tools");
+        
+        // Test search for "github issue" - should match issue-related GitHub tools
+        let results = middleware.search_tools("github issue").await;
+        println!("Search for 'github issue' returned {} results", results.len());
+        for tool in &results {
+            println!("  - {}", tool.name);
+        }
+        assert!(results.len() >= 3, "Should find at least 3 GitHub issue tools");
+        
+        // Test search for "issue comment" - should match issue comment tools
+        let results = middleware.search_tools("issue comment").await;
+        println!("Search for 'issue comment' returned {} results", results.len());
+        for tool in &results {
+            println!("  - {}", tool.name);
+        }
+        assert!(results.len() >= 1, "Should find at least 1 issue comment tool");
+        
+        // Test search for "GitHub repository" - should match issue-related tools
+        let results = middleware.search_tools("GitHub repository").await;
+        println!("Search for 'GitHub repository' returned {} results", results.len());
+        for tool in &results {
+            println!("  - {}", tool.name);
+        }
+        assert!(results.len() >= 3, "Should find at least 3 GitHub repository tools");
+    }
+
     // Integration tests that test tool search through HTTP API
     mod integration_tests {
         use crate::config::{McpConfig, HttpServerConfig, MiddlewareConfig, MiddlewareSpec};
@@ -667,15 +746,34 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
 
+            // Since this is an SSE response, check the content type
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "text/event-stream"
+            );
+
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
+            let body_str = String::from_utf8(body.to_vec()).unwrap();
             
-            assert_eq!(body["jsonrpc"], "2.0");
-            assert_eq!(body["id"], 1);
-            assert!(body.get("result").is_none());
-            assert!(body["error"].is_object());
-            assert_eq!(body["error"]["code"], -32602); // Invalid params
-            assert!(body["error"]["message"].as_str().unwrap().contains("query"));
+            // Parse SSE stream - should contain an error response
+            let sse_lines: Vec<&str> = body_str.lines().collect();
+            let mut found_error = false;
+            
+            for line in sse_lines {
+                if line.starts_with("data: ") {
+                    let data_part = &line[6..]; // Remove "data: " prefix
+                    if let Ok(event_data) = serde_json::from_str::<Value>(data_part) {
+                        if let Some(error) = event_data.get("error") {
+                            assert_eq!(error["code"], -32602); // Invalid params
+                            assert!(error["message"].as_str().unwrap().contains("query"));
+                            found_error = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            assert!(found_error, "Expected to find error about missing query parameter");
         }
 
         #[tokio::test]
@@ -705,17 +803,45 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
 
+            // Since this is an SSE response, check the content type
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "text/event-stream"
+            );
+
             let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
+            let body_str = String::from_utf8(body.to_vec()).unwrap();
             
-            assert_eq!(body["jsonrpc"], "2.0");
-            assert_eq!(body["id"], 1);
+            // Parse SSE stream - should contain notification and response
+            let sse_lines: Vec<&str> = body_str.lines().collect();
+            let mut found_notification = false;
+            let mut found_response = false;
             
-            // Should get a valid response, but probably no results
-            if body.get("result").is_some() {
-                let result = &body["result"];
-                assert!(result.get("content").is_some());
+            for line in sse_lines {
+                if line.starts_with("data: ") {
+                    let data_part = &line[6..]; // Remove "data: " prefix
+                    if let Ok(event_data) = serde_json::from_str::<Value>(data_part) {
+                        // Check for tools/list_changed notification
+                        if let Some(method) = event_data.get("method") {
+                            if method == "notifications/tools/list_changed" {
+                                found_notification = true;
+                            }
+                        }
+                        
+                        // Check for result response
+                        if let Some(result) = event_data.get("result") {
+                            assert_eq!(event_data["jsonrpc"], "2.0");
+                            assert_eq!(event_data["id"], 1);
+                            assert!(result.get("content").is_some());
+                            found_response = true;
+                        }
+                    }
+                }
             }
+            
+            // With empty query, we should still get notification and response
+            assert!(found_notification, "Expected to find tools/list_changed notification");
+            assert!(found_response, "Expected to find search result response");
         }
 
         #[tokio::test]

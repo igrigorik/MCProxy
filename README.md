@@ -4,7 +4,7 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
 
 - **Tool aggregation**: Connects to multiple upstream MCP servers (via `stdio` or `http`) and exposes an aggregated list of all their tools.
 - **Dynamic tool updates**: Listens for `toolListChanged` notifications from upstream servers and dynamically updates its aggregated tool list.
-- **Tool search**: When a large number of tools are available, automatically limit initial list and provide search functionality to search/update exposed tools on demand.
+- **Tool search**: When a large number of tools are available, automatically limit initial list and provide search functionality to search/update exposed tools on demand. Uses cached tool data for fast search operations.
 
 ## Middleware System (TL;DR)
 
@@ -17,7 +17,7 @@ The proxy includes a flexible middleware system for intercepting and modifying r
   - **Tool filtering**: Filters tools based on configurable regex patterns (allow/disallow)
   - **Tool security**: Inspects tool call inputs and blocks calls that match security rules
   - **Tool enrichment**: Augments tool/prompt/resource descriptions (demo)
-  - **Tool search**: Provides intelligent tool management with selective exposure and search functionality
+  - **Tool search**: Provides intelligent tool management with selective exposure and search functionality (uses cached tool data for performance)
 - **JSON configuration**: Server-specific overrides and flexible configuration options
   
 For detailed middleware documentation, see [MIDDLEWARE.md](MIDDLEWARE.md).
