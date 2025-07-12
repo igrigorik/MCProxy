@@ -4,14 +4,20 @@ Rust-based MCP (Model-Context-Protocol) proxy that aggregates tools from multipl
 
 - **Tool aggregation**: Connects to multiple upstream MCP servers (via `stdio` or `http`) and exposes an aggregated list of all their tools.
 - **Dynamic tool updates**: Listens for `toolListChanged` notifications from upstream servers and dynamically updates its aggregated tool list.
+- **Tool search**: When a large number of tools are available, automatically limit initial list and provide search functionality to search/update exposed tools on demand.
 
 ## Middleware System (TL;DR)
 
 The proxy includes a flexible middleware system for intercepting and modifying requests/responses:
 
 - **ClientMiddleware**: Operates on individual server calls (logging, tool filtering, payload inspection for security, etc)
-- **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (description enrichment, etc)
-- **Built-in middleware**: Logging, tool filtering, description enrichment
+- **ProxyMiddleware**: Operates on aggregated tool/prompt/resources from servers (description enrichment, tool search, etc)
+- **Built-in middleware**: 
+  - **Logging**: Logs all operations with timing information per server
+  - **Tool filtering**: Filters tools based on configurable regex patterns (allow/disallow)
+  - **Tool security**: Inspects tool call inputs and blocks calls that match security rules
+  - **Tool enrichment**: Augments tool/prompt/resource descriptions (demo)
+  - **Tool search**: Provides intelligent tool management with selective exposure and search functionality
 - **JSON configuration**: Server-specific overrides and flexible configuration options
   
 For detailed middleware documentation, see [MIDDLEWARE.md](MIDDLEWARE.md).
@@ -36,7 +42,7 @@ The proxy is configured using a JSON file passed as a command-line argument. The
       "authorizationToken": "Bearer GitHUB_PAT_TOKEN"
     }
   },
-    "httpServer": {
+  "httpServer": {
     "host": "127.0.0.1",
     "port": 8081,
     "corsEnabled": true,

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use rmcp::model::{Prompt, Resource, Tool};
+use std::any::Any;
 
 /// A trait for middleware that operates on aggregated results from all downstream servers.
 ///
@@ -17,6 +18,11 @@ pub trait ProxyMiddleware: Send + Sync {
 
     /// Modify the final, aggregated list of resources.
     async fn on_list_resources(&self, _resources: &mut Vec<Resource>);
+    
+    /// Allow downcasting to concrete types
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
 }
 
 #[async_trait]

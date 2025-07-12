@@ -280,6 +280,29 @@ async fn route_mcp_method(
             })
         }
         
+        "notifications/poll" => {
+            #[derive(serde::Deserialize)]
+            struct NotificationPollParams {
+                #[serde(rename = "sinceTimestamp")]
+                since_timestamp: Option<u64>,
+            }
+            
+            let poll_params: Option<NotificationPollParams> = parse_optional_params(params, "notifications/poll")?;
+            let since_timestamp = poll_params.and_then(|p| p.since_timestamp);
+            
+            let notifications = proxy.notification_manager()
+                .get_notifications_since(since_timestamp)
+                .await;
+            
+            serialize_result(serde_json::json!({
+                "notifications": notifications,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            }))
+        }
+        
         _ => {
             warn!("Unknown MCP method: {}", method);
             Err(McpError::invalid_params(format!("Unknown method: {}", method), None))

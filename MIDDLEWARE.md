@@ -25,67 +25,130 @@ The MCP Proxy Server includes a flexible middleware system that allows you to in
 - **Examples**: Security filtering, deduplication, description enrichment
 - **Pattern**: Modify the final collections before returning to client
 
-## Implementation Details
+## Configuration and Registration
 
-### ProxyMiddleware Interface
+Middleware are configured through the configuration file using a flexible JSON-based system. The system supports server-specific client middleware overrides and generic JSON configuration for maximum flexibility.
 
-```rust
-#[async_trait]
-pub trait ProxyMiddleware: Send + Sync {
-    /// Called after aggregating tools from all servers
-    async fn on_list_tools(&self, tools: &mut Vec<Tool>) {}
-    
-    /// Called after aggregating prompts from all servers  
-    async fn on_list_prompts(&self, prompts: &mut Vec<Prompt>) {}
-    
-    /// Called after aggregating resources from all servers
-    async fn on_list_resources(&self, resources: &mut Vec<Resource>) {}
-}
-```
+### Configuration Structure
 
-### ClientMiddleware Interface
-
-```rust
-#[async_trait]
-pub trait ClientMiddleware: Send + Sync {
-    // Before/after hooks for each MCP operation
-    async fn before_list_tools(&self) {}
-    async fn after_list_tools(&self, result: &Result<ListToolsResult, ServiceError>) {}
-    
-    // before_call_tool can return MiddlewareResult::Block to prevent the call
-    async fn before_call_tool(&self, request: &CallToolRequestParam) -> MiddlewareResult {
-        MiddlewareResult::Continue
+```json
+{
+  "httpServer": {
+    "host": "localhost",
+    "port": 8080,
+    "middleware": {
+      "proxy": [
+        {
+          "type": "description_enricher",
+          "enabled": true,
+          "config": {}
+        }
+      ],
+      "client": {
+        "default": [
+          {
+            "type": "logging",
+            "enabled": true,
+            "config": {
+              "level": "info"
+            }
+          }
+        ],
+        "servers": {
+          "critical-server": [
+            {
+              "type": "logging",
+              "enabled": true,
+              "config": {
+                "level": "debug"
+              }
+            }
+          ],
+          "github-server": [
+            {
+              "type": "tool_filter",
+              "enabled": true,
+              "config": {
+                "allow": "issue"
+              }
+            }
+          ]
+        }
+      }
     }
-    async fn after_call_tool(&self, result: &Result<CallToolResult, ServiceError>) {}
-    
-    async fn before_list_prompts(&self) {}
-    async fn after_list_prompts(&self, result: &Result<ListPromptsResult, ServiceError>) {}
-    
-    async fn before_list_resources(&self) {}
-    async fn after_list_resources(&self, result: &Result<ListResourcesResult, ServiceError>) {}
+  }
 }
 ```
 
-### MiddlewareResult
+### Built-in Middleware Types
 
-```rust
-pub enum MiddlewareResult {
-    /// The operation should proceed normally  
-    Continue,
-    /// The operation should be blocked with the given error message
-    Block(String),
+#### Proxy Middleware
+- **`description_enricher`**: Adds "(via mcproxy)" to tool/prompt/resource descriptions
+- **`tool_search`**: Provides intelligent tool management with selective exposure and search functionality
+
+#### Client Middleware  
+- **`logging`**: Logs all operations with timing information per server
+- **`tool_filter`**: Filters tools based on configurable regex patterns (allow/disallow)
+- **`security`**: Inspects tool call inputs and blocks calls that match security rules
+
+### Configuration Options
+
+Each middleware specification supports:
+- **`type`** (required): The middleware type name
+- **`enabled`** (optional, default: true): Whether to enable this middleware
+- **`config`** (optional): Middleware-specific configuration as JSON
+
+### Server-Specific Client Middleware
+
+Client middleware can be configured per-server:
+- **`default`**: Applied to all servers unless overridden
+- **`servers`**: Server-specific overrides by server name
+
+When a server has specific configuration, it completely replaces the default configuration for that server (no merging).
+
+### Advanced Tool Filter Configuration Examples
+
+The `tool_filter` middleware supports flexible regex-based filtering:
+
+```json
+{
+  "type": "tool_filter",
+  "enabled": true,
+  "config": {
+    "allow": "^(file_|search_|git_)"
+  }
 }
 ```
+*Only allows tools starting with "file_", "search_", or "git_"*
 
-Any middleware can block tool calls by returning `MiddlewareResult::Block(message)` from `before_call_tool`. When a middleware blocks a call:
-1. Processing stops immediately (short-circuits remaining middleware)
-2. A blocked `CallToolResult` with `is_error: true` is returned
-3. The actual tool call to downstream servers is never made
-4. All middleware still receive the `after_call_tool` notification
+```json
+{
+  "type": "tool_filter", 
+  "enabled": true,
+  "config": {
+    "disallow": "test|debug|dev|tmp"
+  }
+}
+```
+*Filters out tools containing "test", "debug", "dev", or "tmp"*
 
-## Middleware Examples
+```json
+{
+  "type": "tool_filter",
+  "enabled": true,
+  "config": {
+    "allow": "^(?!.*test).*$"
+  }
+}
+```
+*Allows all tools except those containing "test" (using negative lookahead)*
 
-### LoggingClientMiddleware
+**Priority**: If both `allow` and `disallow` are specified, `allow` takes precedence.
+
+
+## Available Middleware
+
+### Logging (Client Middleware)
 Logs all operations for a specific server with detailed context:
 
 ```rust
@@ -100,7 +163,7 @@ let middleware = LoggingClientMiddleware::new("my-server".to_string());
 ✅ [my-server] Tool call successful
 ```
 
-### ToolFilterClientMiddleware
+### Tool Filter (Client Middleware)
 Filters tools from individual servers based on configurable regex patterns:
 
 ```rust
@@ -121,7 +184,7 @@ let middleware = ToolFilterClientMiddleware::new("server-name".to_string(), conf
 - `{"disallow": "test|debug|dev"}` - filters out tools containing "test", "debug", or "dev"
 - `{}` - uses default behavior (allows everything)
 
-### SecurityClientMiddleware
+### Security (Client Middleware)
 Inspects tool call inputs and blocks calls that match security rules:
 
 ```rust
@@ -237,7 +300,7 @@ let middleware = SecurityClientMiddleware::new("server-name".to_string(), config
 }
 ```
 
-### DescriptionEnricherMiddleware
+### Description Enricher (Proxy Middleware)
 Adds "(via mcproxy)" suffix to all tool/prompt/resource descriptions:
 
 ```rust
@@ -246,9 +309,65 @@ let middleware = DescriptionEnricherMiddleware;
 
 **Example:** "Search files" becomes "Search files (via mcproxy)"
 
-## Creating Custom Middleware
+### Tool Search (Proxy Middleware)
+Provides intelligent tool management when large number of tools are available:
 
-### Custom ProxyMiddleware Example
+```rust
+let config = ToolSearchMiddlewareConfig {
+    enabled: true,
+    max_tools_limit: 50,
+    search_threshold: 0.3,
+    tool_selection_order: vec!["server_priority".to_string()],
+};
+let middleware = ToolSearchMiddleware::new(config);
+```
+
+**How it works:**
+1. **Selective Exposure**: Limits initial tools to `max_tools_limit` count
+2. **Search Tool Injection**: Adds a special `search_available_tools` tool when tools are limited
+3. **Fuzzy Search**: Uses fuzzy matching on tool names and descriptions
+4. **Dynamic Updates**: Replaces exposed tools with search results
+
+**Configuration options:**
+- `enabled`: Enable/disable the feature (default: true)
+- `max_tools_limit`: Maximum tools to expose initially and return in search results (default: 50)
+- `search_threshold`: Minimum similarity score (0.0-1.0, default: 0.3)
+- `tool_selection_order`: Criteria for selecting initial tools (default: ["server_priority"])
+
+**Search tool usage:**
+```json
+{
+  "name": "search_available_tools",
+  "arguments": {
+    "query": "file operations"
+  }
+}
+```
+
+**Example middleware configuration:**
+```json
+{
+  "httpServer": {
+    "middleware": {
+      "proxy": [
+        {
+          "type": "tool_search",
+          "enabled": true,
+          "config": {
+            "maxToolsLimit": 25,
+            "searchThreshold": 0.5,
+            "toolSelectionOrder": ["server_priority"]
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+## Implementation Details
+
+Custom ProxyMiddleware Example
 
 ```rust
 use async_trait::async_trait;
@@ -268,120 +387,59 @@ impl ProxyMiddleware for SecurityFilterMiddleware {
 }
 ```
 
-## Configuration and Registration
 
-Middleware are configured through the configuration file using a flexible JSON-based system. The system supports server-specific client middleware overrides and generic JSON configuration for maximum flexibility.
+### ProxyMiddleware Interface
 
-### Configuration Structure
+```rust
+#[async_trait]
+pub trait ProxyMiddleware: Send + Sync {
+    /// Called after aggregating tools from all servers
+    async fn on_list_tools(&self, tools: &mut Vec<Tool>) {}
+    
+    /// Called after aggregating prompts from all servers  
+    async fn on_list_prompts(&self, prompts: &mut Vec<Prompt>) {}
+    
+    /// Called after aggregating resources from all servers
+    async fn on_list_resources(&self, resources: &mut Vec<Resource>) {}
+}
+```
 
-```json
-{
-  "httpServer": {
-    "host": "localhost",
-    "port": 8080,
-    "middleware": {
-      "proxy": [
-        {
-          "type": "description_enricher",
-          "enabled": true,
-          "config": {}
-        }
-      ],
-      "client": {
-        "default": [
-          {
-            "type": "logging",
-            "enabled": true,
-            "config": {
-              "level": "info"
-            }
-          }
-        ],
-        "servers": {
-          "critical-server": [
-            {
-              "type": "logging",
-              "enabled": true,
-              "config": {
-                "level": "debug"
-              }
-            }
-          ],
-          "github-server": [
-            {
-              "type": "tool_filter",
-              "enabled": true,
-              "config": {
-                "allow": "issue"
-              }
-            }
-          ]
-        }
-      }
+### ClientMiddleware Interface
+
+```rust
+#[async_trait]
+pub trait ClientMiddleware: Send + Sync {
+    // Before/after hooks for each MCP operation
+    async fn before_list_tools(&self) {}
+    async fn after_list_tools(&self, result: &Result<ListToolsResult, ServiceError>) {}
+    
+    // before_call_tool can return MiddlewareResult::Block to prevent the call
+    async fn before_call_tool(&self, request: &CallToolRequestParam) -> MiddlewareResult {
+        MiddlewareResult::Continue
     }
-  }
+    async fn after_call_tool(&self, result: &Result<CallToolResult, ServiceError>) {}
+    
+    async fn before_list_prompts(&self) {}
+    async fn after_list_prompts(&self, result: &Result<ListPromptsResult, ServiceError>) {}
+    
+    async fn before_list_resources(&self) {}
+    async fn after_list_resources(&self, result: &Result<ListResourcesResult, ServiceError>) {}
 }
 ```
 
-### Built-in Middleware Types
+### MiddlewareResult
 
-#### Proxy Middleware
-- **`description_enricher`**: Adds "(via mcproxy)" to tool/prompt/resource descriptions
-
-#### Client Middleware  
-- **`logging`**: Logs all operations with timing information per server
-- **`tool_filter`**: Filters tools based on configurable regex patterns (allow/disallow)
-
-### Configuration Options
-
-Each middleware specification supports:
-- **`type`** (required): The middleware type name
-- **`enabled`** (optional, default: true): Whether to enable this middleware
-- **`config`** (optional): Middleware-specific configuration as JSON
-
-### Server-Specific Client Middleware
-
-Client middleware can be configured per-server:
-- **`default`**: Applied to all servers unless overridden
-- **`servers`**: Server-specific overrides by server name
-
-When a server has specific configuration, it completely replaces the default configuration for that server (no merging).
-
-### Advanced Tool Filter Configuration Examples
-
-The `tool_filter` middleware supports flexible regex-based filtering:
-
-```json
-{
-  "type": "tool_filter",
-  "enabled": true,
-  "config": {
-    "allow": "^(file_|search_|git_)"
-  }
+```rust
+pub enum MiddlewareResult {
+    /// The operation should proceed normally  
+    Continue,
+    /// The operation should be blocked with the given error message
+    Block(String),
 }
 ```
-*Only allows tools starting with "file_", "search_", or "git_"*
 
-```json
-{
-  "type": "tool_filter", 
-  "enabled": true,
-  "config": {
-    "disallow": "test|debug|dev|tmp"
-  }
-}
-```
-*Filters out tools containing "test", "debug", "dev", or "tmp"*
-
-```json
-{
-  "type": "tool_filter",
-  "enabled": true,
-  "config": {
-    "allow": "^(?!.*test).*$"
-  }
-}
-```
-*Allows all tools except those containing "test" (using negative lookahead)*
-
-**Priority**: If both `allow` and `disallow` are specified, `allow` takes precedence.
+Any middleware can block tool calls by returning `MiddlewareResult::Block(message)` from `before_call_tool`. When a middleware blocks a call:
+1. Processing stops immediately (short-circuits remaining middleware)
+2. A blocked `CallToolResult` with `is_error: true` is returned
+3. The actual tool call to downstream servers is never made
+4. All middleware still receive the `after_call_tool` notification

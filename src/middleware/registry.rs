@@ -59,11 +59,12 @@ impl MiddlewareRegistry {
     
     /// Register all built-in middleware factories
     fn register_builtin_middleware(&mut self) {
-        use super::proxy_middleware::DescriptionEnricherFactory;
+        use super::proxy_middleware::{DescriptionEnricherFactory, ToolSearchMiddlewareFactory};
         use super::client_middleware::{LoggingClientFactory, SecurityClientFactory, ToolFilterClientFactory};
         
         // Register proxy middleware
         self.register_proxy_factory(Arc::new(DescriptionEnricherFactory));
+        self.register_proxy_factory(Arc::new(ToolSearchMiddlewareFactory));
         
         // Register client middleware
         self.register_client_factory(Arc::new(LoggingClientFactory));
@@ -88,6 +89,7 @@ mod tests {
         
         // Should have built-in middleware registered
         assert!(registry.get_proxy_factory("description_enricher").is_some());
+        assert!(registry.get_proxy_factory("tool_search").is_some());
         assert!(registry.get_client_factory("logging").is_some());
         assert!(registry.get_client_factory("security").is_some());
         assert!(registry.get_client_factory("tool_filter").is_some());
@@ -99,6 +101,7 @@ mod tests {
         
         // Should be able to find built-in middleware
         assert!(registry.get_proxy_factory("description_enricher").is_some());
+        assert!(registry.get_proxy_factory("tool_search").is_some());
         assert!(registry.get_client_factory("logging").is_some());
         assert!(registry.get_client_factory("security").is_some());
         assert!(registry.get_client_factory("tool_filter").is_some());

@@ -800,6 +800,4 @@ mod tests {
         assert!(body["result"].is_object());
         assert!(body.get("error").is_none());
     }
-
-
 }
